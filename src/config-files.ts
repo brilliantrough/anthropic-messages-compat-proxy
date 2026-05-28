@@ -6,7 +6,8 @@ import { randomUUID } from 'node:crypto';
 const MASKED = '***';
 
 const DEFAULT_ADMIN_ENV: Record<string, string> = {
-  PROXY_CLAUDE_BILLING_HEADER_MODE: 'strip_line',
+  ANTHROPIC_VERSION: "2023-06-01",
+  PROXY_CLAUDE_BILLING_HEADER_MODE: "strip_line",
 };
 
 type SecretEnvAction = 'keep' | 'replace' | 'clear';

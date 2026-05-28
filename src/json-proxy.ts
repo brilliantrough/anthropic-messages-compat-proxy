@@ -38,7 +38,7 @@ import {
 } from './responses-sse.js';
 import { createAdminHandler } from './admin-api.js';
 import { createConfigFileStoreFromPaths } from './config-files.js';
-import { createRuntimeConfigStore, createEndpointStateKey, type RuntimeSnapshot } from './runtime-config.js';
+import { createRuntimeConfigStore, createEndpointStateKey, type RuntimeConfigStore, type RuntimeSnapshot } from './runtime-config.js';
 
 const _envPath = process.env.PROXY_ENV_PATH ?? resolve('.env');
 const runtimeStore = createRuntimeConfigStore({ envPath: _envPath });
@@ -57,7 +57,7 @@ const _adminHandler = createAdminHandler({
 });
 
 const _initialSnapshot = runtimeStore.getSnapshot();
-const _requestContext = new AsyncLocalStorage<RuntimeSnapshot>();
+const _requestContext = new AsyncLocalStorage<RuntimeSnapshot<ProxyRuntimeConfig>>();
 
 function getConfig(): ProxyRuntimeConfig {
   const snap = _requestContext.getStore();

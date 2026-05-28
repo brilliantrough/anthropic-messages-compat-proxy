@@ -1,10 +1,27 @@
 import 'dotenv/config';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { normalizeAnthropicMessageRequest } from './anthropic-input-normalization.js';
 import { isJsonRecord, type ClaudeBillingHeaderMode, type JsonRecord, type JsonValue } from './responses-input-normalization.js';
+import { handleMessagesRequest } from './anthropic-messages-handler.js';
+import { handleModelsRequest } from './anthropic-models-handler.js';
+import { type UpstreamEndpoint, loadFallbackEndpoints } from './anthropic-config.js';
+import { createAdminHandler } from './admin-api.js';
+import { createConfigFileStoreFromPaths } from './config-files.js';
+import { createRuntimeConfigStore } from './runtime-config.js';
+import {
+  normalizeBaseUrl,
+  sendJson,
+  makeAnthropicError,
+  getRequestedModel,
+  restoreClientModel,
+  getOutboundHeaders,
+  applyModelMappingsToModelsPayload,
+  pipeUpstreamStream,
+  readJsonBody,
+} from './anthropic-http-utils.js';
 
 export type AnthropicProxyConfig = {
   instanceName: string;
@@ -16,165 +33,18 @@ export type AnthropicProxyConfig = {
   defaultModel: string;
   modelMappings: Record<string, string>;
   claudeBillingHeaderMode: ClaudeBillingHeaderMode;
+  primaryEndpoint: UpstreamEndpoint;
+  fallbackEndpoints: UpstreamEndpoint[];
+  maxFallbackAttempts: number;
+  maxFallbackTotalMs: number;
+  adminHandler?: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<boolean>;
 };
-
-function normalizeBaseUrl(baseUrl: string) {
-  return baseUrl.replace(/\/+$/, '');
-}
-
-function sendJson(res: ServerResponse, statusCode: number, body: JsonValue) {
-  if (res.writableEnded || res.destroyed) {
-    return;
-  }
-
-  res.writeHead(statusCode, {
-    'content-type': 'application/json; charset=utf-8',
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET, POST, OPTIONS',
-    'access-control-allow-headers': 'Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta',
-  });
-  res.end(JSON.stringify(body, null, 2));
-}
-
-function makeError(type: string, message: string) {
-  return {
-    type: 'error',
-    error: {
-      type,
-      message,
-    },
-  } as JsonRecord;
-}
-
-async function readJsonBody(req: IncomingMessage) {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-
-  const raw = Buffer.concat(chunks).toString('utf8');
-  if (!raw.trim()) {
-    return {} as JsonRecord;
-  }
-
-  return JSON.parse(raw) as JsonRecord;
-}
-
-function wantsStreaming(req: IncomingMessage, body: JsonRecord) {
-  if (body.stream === true) {
-    return true;
-  }
-
-  const accept = req.headers.accept ?? '';
-  return String(accept).includes('text/event-stream');
-}
-
-function getOutboundHeaders(config: AnthropicProxyConfig, inboundHeaders: IncomingMessage['headers']) {
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    accept: 'application/json, text/event-stream',
-    'x-api-key': config.apiKey,
-    'anthropic-version': typeof inboundHeaders['anthropic-version'] === 'string'
-      ? inboundHeaders['anthropic-version']
-      : config.anthropicVersion,
-  };
-
-  const inboundBeta = inboundHeaders['anthropic-beta'];
-  const beta = typeof inboundBeta === 'string' && inboundBeta.trim().length > 0
-    ? inboundBeta
-    : config.anthropicBeta;
-  if (beta) {
-    headers['anthropic-beta'] = beta;
-  }
-
-  return headers;
-}
-
-function getRequestedModel(requestBody: JsonRecord, config: AnthropicProxyConfig) {
-  return typeof requestBody.model === 'string' && requestBody.model.trim().length > 0
-    ? requestBody.model
-    : config.defaultModel;
-}
-
-function restoreClientModelInMessage(payload: unknown, requestedModel: string) {
-  if (!isJsonRecord(payload)) {
-    return payload;
-  }
-
-  return {
-    ...payload,
-    model: requestedModel,
-  } as JsonRecord;
-}
-
-function applyModelMappingsToModelsPayload(payload: unknown, modelMappings: Record<string, string>) {
-  if (!isJsonRecord(payload) || !Array.isArray(payload.data) || Object.keys(modelMappings).length === 0) {
-    return payload;
-  }
-
-  const data = payload.data.map(item => (isJsonRecord(item) ? { ...item } : item));
-  const entriesById = new Map<string, JsonRecord>();
-  const existingIds = new Set<string>();
-
-  for (const item of data) {
-    if (!isJsonRecord(item) || typeof item.id !== 'string') {
-      continue;
-    }
-    entriesById.set(item.id, item);
-    existingIds.add(item.id);
-  }
-
-  for (const [alias, target] of Object.entries(modelMappings)) {
-    if (existingIds.has(alias)) {
-      continue;
-    }
-
-    const targetEntry = entriesById.get(target);
-    if (!targetEntry) {
-      continue;
-    }
-
-    data.push({
-      ...targetEntry,
-      id: alias,
-    });
-    existingIds.add(alias);
-  }
-
-  return {
-    ...payload,
-    data,
-  } as JsonRecord;
-}
-
-async function pipeUpstreamStream(upstreamResponse: Response, res: ServerResponse) {
-  res.writeHead(upstreamResponse.status, {
-    'content-type': upstreamResponse.headers.get('content-type') ?? 'text/event-stream; charset=utf-8',
-    'cache-control': upstreamResponse.headers.get('cache-control') ?? 'no-cache',
-    connection: 'keep-alive',
-    'access-control-allow-origin': '*',
-  });
-
-  if (!upstreamResponse.body) {
-    res.end();
-    return;
-  }
-
-  const reader = upstreamResponse.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    res.write(Buffer.from(value));
-  }
-  res.end();
-}
 
 export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
   const baseUrl = normalizeBaseUrl(config.primaryProviderBaseUrl);
   const upstreamMessagesUrl = `${baseUrl}/v1/messages`;
   const upstreamModelsUrl = `${baseUrl}/v1/models`;
+  const hasFallback = (config.fallbackEndpoints?.length ?? 0) > 0;
 
   return createServer(async (req, res) => {
     try {
@@ -188,6 +58,11 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
         return;
       }
 
+      if (config.adminHandler) {
+        const handled = await config.adminHandler(req, res);
+        if (handled) return;
+      }
+
       if (req.method === 'GET' && req.url === '/healthz') {
         sendJson(res, 200, {
           ok: true,
@@ -198,40 +73,50 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
           anthropicVersion: config.anthropicVersion,
           anthropicBeta: config.anthropicBeta ?? null,
           modelMappings: config.modelMappings,
+          claudeBillingHeaderMode: config.claudeBillingHeaderMode,
         });
         return;
       }
 
       if (req.method === 'GET' && req.url === '/v1/models') {
-        const upstreamResponse = await fetch(upstreamModelsUrl, {
-          method: 'GET',
-          headers: getOutboundHeaders(config, req.headers),
-        });
-        const upstreamText = await upstreamResponse.text();
-        let payload: unknown;
-        try {
-          payload = JSON.parse(upstreamText);
-        } catch {
-          sendJson(res, 502, makeError('api_error', 'Upstream models endpoint returned invalid JSON'));
-          return;
-        }
+        if (hasFallback) {
+          await handleModelsRequest(req, res, {
+            primaryEndpoint: config.primaryEndpoint,
+            anthropicVersion: config.anthropicVersion,
+            anthropicBeta: config.anthropicBeta,
+            modelMappings: config.modelMappings,
+          });
+        } else {
+          const upstreamResponse = await fetch(upstreamModelsUrl, {
+            method: 'GET',
+            headers: getOutboundHeaders(config.apiKey, config.anthropicVersion, config.anthropicBeta, req.headers),
+          });
+          const upstreamText = await upstreamResponse.text();
+          let payload: unknown;
+          try {
+            payload = JSON.parse(upstreamText);
+          } catch {
+            sendJson(res, 502, makeAnthropicError('api_error', 'Upstream models endpoint returned invalid JSON'));
+            return;
+          }
 
-        sendJson(
-          res,
-          upstreamResponse.status,
-          (upstreamResponse.ok ? applyModelMappingsToModelsPayload(payload, config.modelMappings) : payload) as JsonValue,
-        );
+          sendJson(
+            res,
+            upstreamResponse.status,
+            (upstreamResponse.ok ? applyModelMappingsToModelsPayload(payload, config.modelMappings) : payload) as JsonValue,
+          );
+        }
         return;
       }
 
       if (req.method !== 'POST' || req.url !== '/v1/messages') {
-        sendJson(res, 404, makeError('not_found_error', 'Supported routes: GET /healthz, GET /v1/models, POST /v1/messages'));
+        sendJson(res, 404, makeAnthropicError('not_found_error', 'Supported routes: GET /healthz, GET /v1/models, POST /v1/messages'));
         return;
       }
 
       const contentType = req.headers['content-type'] ?? '';
       if (!String(contentType).includes('application/json')) {
-        sendJson(res, 415, makeError('invalid_request_error', 'Content-Type must be application/json'));
+        sendJson(res, 415, makeAnthropicError('invalid_request_error', 'Content-Type must be application/json'));
         return;
       }
 
@@ -239,20 +124,34 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
       try {
         requestBody = await readJsonBody(req);
       } catch (error) {
-        sendJson(res, 400, makeError('invalid_request_error', `Invalid JSON request body: ${error instanceof Error ? error.message : String(error)}`));
+        sendJson(res, 400, makeAnthropicError('invalid_request_error', `Invalid JSON request body: ${error instanceof Error ? error.message : String(error)}`));
         return;
       }
 
-      const requestedModel = getRequestedModel(requestBody, config);
+      if (hasFallback) {
+        await handleMessagesRequest(req, res, requestBody, {
+          primaryEndpoint: config.primaryEndpoint,
+          fallbackEndpoints: config.fallbackEndpoints,
+          anthropicVersion: config.anthropicVersion,
+          anthropicBeta: config.anthropicBeta,
+          defaultModel: config.defaultModel,
+          modelMappings: config.modelMappings,
+          maxFallbackAttempts: config.maxFallbackAttempts,
+          maxFallbackTotalMs: config.maxFallbackTotalMs,
+        });
+        return;
+      }
+
+      const requestedModel = getRequestedModel(requestBody, config.defaultModel);
       const upstreamBody = normalizeAnthropicMessageRequest(requestBody, config);
       const upstreamResponse = await fetch(upstreamMessagesUrl, {
         method: 'POST',
-        headers: getOutboundHeaders(config, req.headers),
+        headers: getOutboundHeaders(config.apiKey, config.anthropicVersion, config.anthropicBeta, req.headers),
         body: JSON.stringify(upstreamBody),
       });
 
       const upstreamContentType = upstreamResponse.headers.get('content-type') ?? '';
-      if (wantsStreaming(req, requestBody) || upstreamContentType.includes('text/event-stream')) {
+      if (upstreamContentType.includes('text/event-stream')) {
         await pipeUpstreamStream(upstreamResponse, res);
         return;
       }
@@ -262,17 +161,17 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
       try {
         payload = JSON.parse(upstreamText);
       } catch {
-        sendJson(res, 502, makeError('api_error', 'Upstream messages endpoint returned invalid JSON'));
+        sendJson(res, 502, makeAnthropicError('api_error', 'Upstream messages endpoint returned invalid JSON'));
         return;
       }
 
       sendJson(
         res,
         upstreamResponse.status,
-        (upstreamResponse.ok ? restoreClientModelInMessage(payload, requestedModel) : payload) as JsonValue,
+        (upstreamResponse.ok ? restoreClientModel(payload, requestedModel) : payload) as JsonValue,
       );
     } catch (error) {
-      sendJson(res, 500, makeError('api_error', error instanceof Error ? error.message : String(error)));
+      sendJson(res, 500, makeAnthropicError('api_error', error instanceof Error ? error.message : String(error)));
     }
   });
 }
@@ -310,6 +209,21 @@ export function createConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Anthr
 
   const port = Number(env.PORT ?? 11234);
   const primaryProviderBaseUrl = env.PRIMARY_PROVIDER_BASE_URL ?? 'https://api.anthropic.com';
+  const normalizedBaseUrl = normalizeBaseUrl(primaryProviderBaseUrl);
+  const fallbackConfigPath = env.FALLBACK_CONFIG_PATH ?? '';
+  const modelMappings = loadModelMappings(resolve(env.MODEL_MAP_PATH ?? 'model-map.json'));
+
+  const primaryEndpoint: UpstreamEndpoint = {
+    name: env.PRIMARY_PROVIDER_NAME ?? 'primary-provider',
+    url: `${normalizedBaseUrl}/v1/messages`,
+    apiKey,
+    isFallback: false,
+  };
+
+  const fallbackEndpoints = fallbackConfigPath
+    ? loadFallbackEndpoints(fallbackConfigPath, env as Record<string, string>)
+    : [];
+
   return {
     host: env.HOST ?? '0.0.0.0',
     port,
@@ -320,13 +234,43 @@ export function createConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Anthr
     anthropicVersion: env.ANTHROPIC_VERSION ?? '2023-06-01',
     anthropicBeta: env.ANTHROPIC_BETA?.trim() || undefined,
     defaultModel: env.PRIMARY_PROVIDER_DEFAULT_MODEL ?? 'claude-sonnet-4-5',
-    modelMappings: loadModelMappings(resolve(env.MODEL_MAP_PATH ?? 'model-map.json')),
+    modelMappings,
     claudeBillingHeaderMode: parseClaudeBillingHeaderMode(env.PROXY_CLAUDE_BILLING_HEADER_MODE),
+    primaryEndpoint,
+    fallbackEndpoints,
+    maxFallbackAttempts: Number(env.PROXY_MAX_FALLBACK_ATTEMPTS ?? Math.max(1, fallbackEndpoints.length)),
+    maxFallbackTotalMs: Number(env.PROXY_MAX_FALLBACK_TOTAL_MS ?? 30000),
   };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const config = createConfigFromEnv();
+  const envPath = process.env.PROXY_ENV_PATH ?? resolve('.env');
+  const runtimeStore = createRuntimeConfigStore({ envPath, mode: 'anthropic' });
+  const snap = runtimeStore.getSnapshot();
+  const adminConfigStore = createConfigFileStoreFromPaths({
+    envPath,
+    fallbackPath: snap.config.fallbackConfigPath,
+    modelMapPath: snap.config.modelMappingPath,
+  });
+  const getAdminStats = () => {
+    const s = runtimeStore.getSnapshot();
+    return {
+      instanceName: s.config.instanceName,
+      anthropicVersion: s.config.anthropicVersion,
+      anthropicBeta: s.config.anthropicBeta ?? null,
+      upstreamMessagesUrl: s.config.upstreamMessagesUrl,
+      upstreamModelsUrl: s.config.upstreamModelsUrl,
+      claudeBillingHeaderMode: s.config.claudeBillingHeaderMode,
+      modelMappings: s.config.modelMappings,
+    };
+  };
+  const adminHandler = createAdminHandler({
+    configStore: adminConfigStore,
+    runtimeStore,
+    getAdminStats,
+  });
+  const baseConfig = createConfigFromEnv();
+  const config = { ...baseConfig, adminHandler };
   const server = createAnthropicProxyServer(config);
   server.listen(config.port, config.host, () => {
     console.log(JSON.stringify({

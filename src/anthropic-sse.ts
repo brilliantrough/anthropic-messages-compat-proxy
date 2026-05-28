@@ -87,6 +87,39 @@ export function getAnthropicStreamTextDeltaLength(payload: unknown) {
   return delta.type === 'text_delta' && typeof delta.text === 'string' ? delta.text.length : 0;
 }
 
+export function isAnthropicStreamEventWithUsableContent(event: SseEvent): boolean {
+  const payload = parseStreamPayload(event.data);
+  if (!isJsonRecord(payload) || typeof payload.type !== 'string') {
+    return false;
+  }
+
+  if (payload.type === 'content_block_delta' && isJsonRecord(payload.delta)) {
+    const delta = payload.delta;
+    if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text.length > 0) {
+      return true;
+    }
+    if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string' && delta.thinking.length > 0) {
+      return true;
+    }
+    if (delta.type === 'signature_delta' && typeof delta.signature === 'string' && delta.signature.length > 0) {
+      return true;
+    }
+    if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
+      return true;
+    }
+  }
+
+  if (payload.type === 'content_block_start' && isJsonRecord(payload.content_block)) {
+    const block = payload.content_block;
+    if (block.type === 'tool_use') {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
 function mapAnthropicUsage(usage: JsonRecord, model?: string, messageId?: string) {
   const mapped: JsonRecord = {};
 
