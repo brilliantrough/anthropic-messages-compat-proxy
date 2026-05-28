@@ -1,0 +1,5 @@
+{
+  "model_mappings": {
+    "public-claude": "claude-sonnet-4-5"
+  }
+}

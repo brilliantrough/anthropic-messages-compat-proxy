@@ -1,0 +1,46 @@
+{
+  "name": "anthropic-messages-compat-proxy",
+  "version": "0.1.0",
+  "description": "Compatibility proxy for Anthropic Messages API providers with SSE passthrough, model aliases, and local runtime tooling.",
+  "private": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/brilliantrough/anthropic-messages-compat-proxy.git"
+  },
+  "homepage": "https://github.com/brilliantrough/anthropic-messages-compat-proxy#readme",
+  "bugs": {
+    "url": "https://github.com/brilliantrough/anthropic-messages-compat-proxy/issues"
+  },
+  "keywords": [
+    "anthropic",
+    "claude",
+    "messages-api",
+    "api-proxy",
+    "sse",
+    "streaming",
+    "typescript",
+    "compatibility",
+    "fallback",
+    "admin-ui"
+  ],
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check:anthropic-input": "tsx checks/check-anthropic-input-normalization.ts",
+    "check:anthropic-sse": "tsx checks/check-anthropic-sse.ts",
+    "check:anthropic-proxy-basic": "tsx checks/check-anthropic-proxy-basic.ts",
+    "check": "npm run check:anthropic-input && npm run check:anthropic-sse && npm run check:anthropic-proxy-basic",
+    "proxy": "tsx src/anthropic-proxy.ts",
+    "proxy:dev": "tsx src/anthropic-proxy.ts",
+    "proxy:start": "node dist/anthropic-proxy.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.2"
+  }
+}

@@ -1,0 +1,12 @@
+.env
+config.json
+node_modules/
+dist/
+logs/
+captures/
+sse-failures/
+.superpowers/
+.opencode/
+.worktrees/
+instances/proxy-*/
+docs/superpowers/
