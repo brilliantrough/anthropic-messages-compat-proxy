@@ -121,9 +121,9 @@ npm run build
 
 ## Current Scope
 
-This first version implements a transparent Anthropic Messages proxy with JSON forwarding, model aliases, header normalization, top-level `system` billing-header cleanup, `/v1/models`, `/healthz`, and SSE passthrough.
+This current version implements a transparent Anthropic Messages proxy with JSON forwarding, model aliases, header normalization, top-level `system` billing-header cleanup, non-streaming fallback, stream fallback gating, `/v1/models`, `/healthz`, `/admin`, and `/admin/monitor`.
 
-Fallback routing, admin UI, and monitor assets are kept in the repository skeleton for follow-up parity work with the Responses proxy, but they are not wired into the Anthropic entrypoint yet.
+Depth parity with the Responses proxy is still evolving. The main remaining follow-up area is broader operational hardening and repeated-failure behavior beyond the current cooldown/circuit-breaker coverage.
 
 ## Friendly Links
 

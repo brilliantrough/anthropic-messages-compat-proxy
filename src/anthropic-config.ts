@@ -30,6 +30,13 @@ export type AnthropicRuntimeConfig = {
   fallbackEndpoints: UpstreamEndpoint[];
   allEndpoints: UpstreamEndpoint[];
   adminAllowHost: boolean;
+  endpointTimeoutCooldownMs: number;
+  endpointInvalidResponseCooldownMs: number;
+  endpointAuthCooldownMs: number;
+  endpointFailureThreshold: number;
+  endpointHalfOpenMaxProbes: number;
+  maxFallbackAttempts: number;
+  maxFallbackTotalMs: number;
   fallbackConfigPath: string;
   modelMappingPath: string;
 };
@@ -182,6 +189,14 @@ export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntim
   const anthropicBeta = env.ANTHROPIC_BETA?.trim() || undefined;
   const defaultModel = env.PRIMARY_PROVIDER_DEFAULT_MODEL ?? 'claude-sonnet-4-5';
   const claudeBillingHeaderMode = parseClaudeBillingHeaderMode(env.PROXY_CLAUDE_BILLING_HEADER_MODE);
+  const fallbackEndpoints = loadFallbackEndpoints(fallbackPath, env);
+  const endpointTimeoutCooldownMs = Number(env.PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS ?? 120000);
+  const endpointInvalidResponseCooldownMs = Number(env.PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS ?? 120000);
+  const endpointAuthCooldownMs = Number(env.PROXY_ENDPOINT_AUTH_COOLDOWN_MS ?? 1800000);
+  const endpointFailureThreshold = Number(env.PROXY_ENDPOINT_FAILURE_THRESHOLD ?? 1);
+  const endpointHalfOpenMaxProbes = Number(env.PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES ?? 1);
+  const maxFallbackAttempts = Number(env.PROXY_MAX_FALLBACK_ATTEMPTS ?? Math.max(1, fallbackEndpoints.length));
+  const maxFallbackTotalMs = Number(env.PROXY_MAX_FALLBACK_TOTAL_MS ?? 30000);
 
   const primaryEndpoint: UpstreamEndpoint = {
     name: primaryProviderName,
@@ -190,7 +205,6 @@ export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntim
     isFallback: false,
   };
 
-  const fallbackEndpoints = loadFallbackEndpoints(fallbackPath, env);
   const modelMappings = loadModelMappings(modelMapPath);
   const allEndpoints = [primaryEndpoint, ...fallbackEndpoints];
 
@@ -212,6 +226,13 @@ export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntim
     fallbackEndpoints,
     allEndpoints,
     adminAllowHost: isEnabled(env.PROXY_ADMIN_ALLOW_HOST),
+    endpointTimeoutCooldownMs,
+    endpointInvalidResponseCooldownMs,
+    endpointAuthCooldownMs,
+    endpointFailureThreshold,
+    endpointHalfOpenMaxProbes,
+    maxFallbackAttempts,
+    maxFallbackTotalMs,
     fallbackConfigPath: resolve(fallbackPath),
     modelMappingPath: resolve(modelMapPath),
   };

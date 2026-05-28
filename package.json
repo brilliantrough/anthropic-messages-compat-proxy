@@ -30,7 +30,7 @@
     "check:anthropic-input": "tsx checks/check-anthropic-input-normalization.ts",
     "check:anthropic-sse": "tsx checks/check-anthropic-sse.ts",
     "check:anthropic-proxy-basic": "tsx checks/check-anthropic-proxy-basic.ts",
-    "check": "npm run check:anthropic-input && npm run check:anthropic-sse && npm run check:anthropic-proxy-basic && npm run check:anthropic-config && npm run check:anthropic-nonstream-fallback && npm run check:anthropic-stream-fallback && npm run check:anthropic-admin-config-api && npm run check:anthropic-admin-monitor && npm run check:anthropic-runtime-reload && npm run check:anthropic-docs-smoke",
+    "check": "npm run check:anthropic-input && npm run check:anthropic-sse && npm run check:anthropic-proxy-basic && npm run check:anthropic-config && npm run check:anthropic-nonstream-fallback && npm run check:anthropic-stream-fallback && npm run check:anthropic-cooldown && npm run check:anthropic-admin-config-api && npm run check:anthropic-admin-monitor && npm run check:anthropic-runtime-reload && npm run check:anthropic-docs-smoke",
     "proxy": "tsx src/anthropic-proxy.ts",
     "proxy:dev": "tsx src/anthropic-proxy.ts",
     "proxy:start": "node dist/anthropic-proxy.js",
@@ -38,6 +38,7 @@
     "check:anthropic-config": "tsx checks/check-anthropic-config.ts",
     "check:anthropic-nonstream-fallback": "tsx checks/check-anthropic-nonstream-fallback.ts",
     "check:anthropic-stream-fallback": "tsx checks/check-anthropic-stream-fallback.ts",
+    "check:anthropic-cooldown": "tsx checks/check-anthropic-cooldown.ts",
     "check:anthropic-admin-config-api": "tsx checks/check-anthropic-admin-config-api.ts",
     "check:anthropic-admin-monitor": "tsx checks/check-anthropic-admin-monitor.ts",
     "check:anthropic-runtime-reload": "tsx checks/check-anthropic-runtime-reload.ts"

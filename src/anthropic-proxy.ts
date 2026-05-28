@@ -11,6 +11,7 @@ import { type UpstreamEndpoint, loadFallbackEndpoints } from './anthropic-config
 import { createAdminHandler } from './admin-api.js';
 import { createConfigFileStoreFromPaths } from './config-files.js';
 import { createRuntimeConfigStore } from './runtime-config.js';
+import { createEndpointHealthStore, type EndpointHealthStore } from './proxy-core.js';
 import {
   normalizeBaseUrl,
   sendJson,
@@ -35,8 +36,14 @@ export type AnthropicProxyConfig = {
   claudeBillingHeaderMode: ClaudeBillingHeaderMode;
   primaryEndpoint: UpstreamEndpoint;
   fallbackEndpoints: UpstreamEndpoint[];
+  endpointTimeoutCooldownMs: number;
+  endpointInvalidResponseCooldownMs: number;
+  endpointAuthCooldownMs: number;
+  endpointFailureThreshold: number;
+  endpointHalfOpenMaxProbes: number;
   maxFallbackAttempts: number;
   maxFallbackTotalMs: number;
+  endpointHealthStore?: EndpointHealthStore;
   adminHandler?: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<boolean>;
 };
 
@@ -45,6 +52,13 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
   const upstreamMessagesUrl = `${baseUrl}/v1/messages`;
   const upstreamModelsUrl = `${baseUrl}/v1/models`;
   const hasFallback = (config.fallbackEndpoints?.length ?? 0) > 0;
+  const endpointHealthStore = config.endpointHealthStore ?? createEndpointHealthStore({
+    endpointTimeoutCooldownMs: config.endpointTimeoutCooldownMs ?? 120000,
+    endpointInvalidResponseCooldownMs: config.endpointInvalidResponseCooldownMs ?? 120000,
+    endpointAuthCooldownMs: config.endpointAuthCooldownMs ?? 1800000,
+    endpointFailureThreshold: config.endpointFailureThreshold ?? 1,
+    endpointHalfOpenMaxProbes: config.endpointHalfOpenMaxProbes ?? 1,
+  });
 
   return createServer(async (req, res) => {
     try {
@@ -138,6 +152,7 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
           modelMappings: config.modelMappings,
           maxFallbackAttempts: config.maxFallbackAttempts,
           maxFallbackTotalMs: config.maxFallbackTotalMs,
+          endpointHealthStore,
         });
         return;
       }
@@ -238,6 +253,11 @@ export function createConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Anthr
     claudeBillingHeaderMode: parseClaudeBillingHeaderMode(env.PROXY_CLAUDE_BILLING_HEADER_MODE),
     primaryEndpoint,
     fallbackEndpoints,
+    endpointTimeoutCooldownMs: Number(env.PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS ?? 120000),
+    endpointInvalidResponseCooldownMs: Number(env.PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS ?? 120000),
+    endpointAuthCooldownMs: Number(env.PROXY_ENDPOINT_AUTH_COOLDOWN_MS ?? 1800000),
+    endpointFailureThreshold: Number(env.PROXY_ENDPOINT_FAILURE_THRESHOLD ?? 1),
+    endpointHalfOpenMaxProbes: Number(env.PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES ?? 1),
     maxFallbackAttempts: Number(env.PROXY_MAX_FALLBACK_ATTEMPTS ?? Math.max(1, fallbackEndpoints.length)),
     maxFallbackTotalMs: Number(env.PROXY_MAX_FALLBACK_TOTAL_MS ?? 30000),
   };
@@ -247,6 +267,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const envPath = process.env.PROXY_ENV_PATH ?? resolve('.env');
   const runtimeStore = createRuntimeConfigStore({ envPath, mode: 'anthropic' });
   const snap = runtimeStore.getSnapshot();
+  const endpointHealthStore = createEndpointHealthStore({
+    endpointTimeoutCooldownMs: snap.config.endpointTimeoutCooldownMs,
+    endpointInvalidResponseCooldownMs: snap.config.endpointInvalidResponseCooldownMs,
+    endpointAuthCooldownMs: snap.config.endpointAuthCooldownMs,
+    endpointFailureThreshold: snap.config.endpointFailureThreshold,
+    endpointHalfOpenMaxProbes: snap.config.endpointHalfOpenMaxProbes,
+  });
   const adminConfigStore = createConfigFileStoreFromPaths({
     envPath,
     fallbackPath: snap.config.fallbackConfigPath,
@@ -258,11 +285,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       instanceName: s.config.instanceName,
       anthropicVersion: s.config.anthropicVersion,
       anthropicBeta: s.config.anthropicBeta ?? null,
-      upstreamMessagesUrl: s.config.upstreamMessagesUrl,
-      upstreamModelsUrl: s.config.upstreamModelsUrl,
-      claudeBillingHeaderMode: s.config.claudeBillingHeaderMode,
-      modelMappings: s.config.modelMappings,
-    };
+        upstreamMessagesUrl: s.config.upstreamMessagesUrl,
+        upstreamModelsUrl: s.config.upstreamModelsUrl,
+        claudeBillingHeaderMode: s.config.claudeBillingHeaderMode,
+        modelMappings: s.config.modelMappings,
+        endpointHealth: endpointHealthStore.listSnapshots(s.config.allEndpoints),
+      };
   };
   const adminHandler = createAdminHandler({
     configStore: adminConfigStore,
@@ -270,7 +298,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     getAdminStats,
   });
   const baseConfig = createConfigFromEnv();
-  const config = { ...baseConfig, adminHandler };
+  const config = { ...baseConfig, adminHandler, endpointHealthStore };
   const server = createAnthropicProxyServer(config);
   server.listen(config.port, config.host, () => {
     console.log(JSON.stringify({

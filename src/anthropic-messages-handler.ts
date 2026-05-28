@@ -3,7 +3,7 @@ import { type JsonValue } from './responses-input-normalization.js';
 import { normalizeAnthropicMessageRequest } from './anthropic-input-normalization.js';
 import type { UpstreamEndpoint } from './anthropic-config.js';
 import { getAnthropicFallbackReason, isAnthropicMessageWithUsableContent, type AnthropicFallbackReason } from './anthropic-errors.js';
-import { buildEndpointOrder, createFallbackBudget, canFallback } from './proxy-core.js';
+import { buildEndpointOrder, createFallbackBudget, canFallback, type EndpointHealthStore } from './proxy-core.js';
 import {
   sendJson,
   makeAnthropicError,
@@ -22,6 +22,7 @@ export type AnthropicMessagesHandlerOptions = {
   modelMappings: Record<string, string>;
   maxFallbackAttempts: number;
   maxFallbackTotalMs: number;
+  endpointHealthStore: EndpointHealthStore;
 };
 
 async function readSseStreamAsText(response: Response): Promise<string> {
@@ -79,6 +80,10 @@ export async function handleMessagesRequest(
 
   for (let i = 0; i < endpoints.length; i++) {
     const endpoint = endpoints[i];
+    if (!options.endpointHealthStore.isEndpointAvailable(endpoint)) {
+      continue;
+    }
+    options.endpointHealthStore.reserveEndpointProbe(endpoint);
     const headers = getOutboundHeaders(endpoint.apiKey, options.anthropicVersion, options.anthropicBeta, req.headers);
 
     let upstreamResponse: Response;
@@ -89,7 +94,8 @@ export async function handleMessagesRequest(
         body: JSON.stringify(upstreamBody),
       });
     } catch (error) {
-      const _reason: AnthropicFallbackReason = 'connect_error';
+      options.endpointHealthStore.releaseEndpointProbe(endpoint);
+      options.endpointHealthStore.markEndpointFailure(endpoint, 'connect_error');
       if (canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
         budget.attemptsUsed += 1;
         continue;
@@ -106,6 +112,8 @@ export async function handleMessagesRequest(
       const events = parseSse(sseText);
 
       if (hasUsableContentInSseEvents(events)) {
+        options.endpointHealthStore.releaseEndpointProbe(endpoint);
+        options.endpointHealthStore.markEndpointSuccess(endpoint);
         res.writeHead(upstreamResponse.status, {
           'content-type': 'text/event-stream; charset=utf-8',
           'cache-control': 'no-cache',
@@ -116,6 +124,8 @@ export async function handleMessagesRequest(
         return;
       }
 
+      options.endpointHealthStore.releaseEndpointProbe(endpoint);
+      options.endpointHealthStore.markEndpointFailure(endpoint, 'stream_no_usable_content');
       if (canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
         budget.attemptsUsed += 1;
         continue;
@@ -142,6 +152,10 @@ export async function handleMessagesRequest(
 
     if (!upstreamResponse.ok) {
       const fallbackReason = getAnthropicFallbackReason(upstreamResponse.status);
+      options.endpointHealthStore.releaseEndpointProbe(endpoint);
+      if (fallbackReason) {
+        options.endpointHealthStore.markEndpointFailure(endpoint, fallbackReason);
+      }
       if (fallbackReason && canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
         budget.attemptsUsed += 1;
         continue;
@@ -152,13 +166,19 @@ export async function handleMessagesRequest(
     }
 
     if (!isAnthropicMessageWithUsableContent(payload)) {
+      options.endpointHealthStore.releaseEndpointProbe(endpoint);
+      options.endpointHealthStore.markEndpointFailure(endpoint, 'empty_response');
       if (canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
         budget.attemptsUsed += 1;
         continue;
       }
       console.warn('Non-stream fallback budget exhausted; returning empty upstream 200 response to client');
+      sendJson(res, upstreamResponse.status, restoreClientModel(payload, requestedModel) as JsonValue);
+      return;
     }
 
+    options.endpointHealthStore.releaseEndpointProbe(endpoint);
+    options.endpointHealthStore.markEndpointSuccess(endpoint);
     sendJson(res, upstreamResponse.status, restoreClientModel(payload, requestedModel) as JsonValue);
     return;
   }
