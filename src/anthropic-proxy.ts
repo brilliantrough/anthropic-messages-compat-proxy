@@ -2,8 +2,8 @@ import 'dotenv/config';
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
-import { normalizeAnthropicMessageRequest } from './anthropic-input-normalization.js';
 import { isJsonRecord, type ClaudeBillingHeaderMode, type JsonRecord, type JsonValue } from './responses-input-normalization.js';
 import {
   handleMessagesRequest,
@@ -12,10 +12,10 @@ import {
   type AnthropicMessagesHandlerOptions,
 } from './anthropic-messages-handler.js';
 import { handleModelsRequest } from './anthropic-models-handler.js';
-import { type UpstreamEndpoint, type StreamMode, loadFallbackEndpoints } from './anthropic-config.js';
+import { type UpstreamEndpoint, type StreamMode, type AnthropicRuntimeConfig, loadFallbackEndpoints } from './anthropic-config.js';
 import { createAdminHandler } from './admin-api.js';
 import { createConfigFileStoreFromPaths } from './config-files.js';
-import { createRuntimeConfigStore } from './runtime-config.js';
+import { createRuntimeConfigStore, type RuntimeConfigStore, type RuntimeSnapshot } from './runtime-config.js';
 import { createEndpointHealthStore, type EndpointHealthStore } from './proxy-core.js';
 import {
   normalizeBaseUrl,
@@ -36,6 +36,23 @@ const DEFAULT_TIMEOUTS = {
   maxConcurrentRequests: 128,
   maxFallbackTotalMs: 30000,
 } as const;
+
+const _requestContext = new AsyncLocalStorage<RuntimeSnapshot<AnthropicRuntimeConfig>>();
+let _runtimeStore: RuntimeConfigStore<AnthropicRuntimeConfig> | null = null;
+
+function getConfig(): AnthropicRuntimeConfig {
+  const snap = _requestContext.getStore();
+  return snap ? snap.config : _initialSnapshot.config;
+}
+
+function getLatestSnapshot(): RuntimeSnapshot<AnthropicRuntimeConfig> {
+  if (_runtimeStore) {
+    return _runtimeStore.getSnapshot();
+  }
+  return _initialSnapshot;
+}
+
+let _initialSnapshot: RuntimeSnapshot<AnthropicRuntimeConfig>;
 
 export type AnthropicProxyConfig = {
   port: number;
@@ -79,9 +96,6 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
   const baseUrl = normalizeBaseUrl(config.primaryProviderBaseUrl);
   const upstreamMessagesUrl = `${baseUrl}/v1/messages`;
   const upstreamModelsUrl = `${baseUrl}/v1/models`;
-  const anthropicVersion = config.anthropicVersion ?? '2023-06-01';
-  const defaultModel = config.defaultModel ?? 'claude-sonnet-4-5';
-  const modelMappings = config.modelMappings ?? {};
   const instanceName = config.instanceName ?? 'anthropic-proxy';
 
   const primaryEndpoint = config.primaryEndpoint ?? {
@@ -101,132 +115,188 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
   const stats = config.stats ?? createProxyStats();
   const maxConcurrentRequests = config.maxConcurrentRequests ?? DEFAULT_TIMEOUTS.maxConcurrentRequests;
 
-  const resolveHandlerOptions = (): AnthropicMessagesHandlerOptions => ({
-    primaryEndpoint,
-    fallbackEndpoints,
-    anthropicVersion,
-    anthropicBeta: config.anthropicBeta,
-    defaultModel,
-    modelMappings,
-    maxFallbackAttempts: config.maxFallbackAttempts ?? Math.max(1, fallbackEndpoints.length),
-    maxFallbackTotalMs: config.maxFallbackTotalMs ?? DEFAULT_TIMEOUTS.maxFallbackTotalMs,
-    endpointHealthStore,
-    upstreamTimeoutMs: config.upstreamTimeoutMs ?? DEFAULT_TIMEOUTS.upstreamTimeoutMs,
-    nonStreamingRequestTimeoutMs: config.nonStreamingRequestTimeoutMs ?? DEFAULT_TIMEOUTS.nonStreamingRequestTimeoutMs,
-    firstByteTimeoutMs: config.firstByteTimeoutMs ?? DEFAULT_TIMEOUTS.firstByteTimeoutMs,
-    firstTextTimeoutMs: config.firstTextTimeoutMs ?? DEFAULT_TIMEOUTS.firstTextTimeoutMs,
-    streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? DEFAULT_TIMEOUTS.streamIdleTimeoutMs,
-    totalRequestTimeoutMs: config.totalRequestTimeoutMs ?? DEFAULT_TIMEOUTS.totalRequestTimeoutMs,
-    defaultStreamMode: config.defaultStreamMode ?? 'normalized',
-    fallbackOnRetryable4xx: config.fallbackOnRetryable4xx ?? true,
-    fallbackOnCompat4xx: config.fallbackOnCompat4xx ?? true,
-    compatFallbackPatterns: config.compatFallbackPatterns ?? [],
-    clientErrorPatterns: config.clientErrorPatterns ?? [],
-    stats,
-  });
+  _initialSnapshot = {
+    runtimeVersion: 0,
+    config: {
+      host: config.host ?? '0.0.0.0',
+      port: config.port,
+      instanceName,
+      primaryProviderName: config.primaryProviderName,
+      primaryProviderBaseUrl: baseUrl,
+      apiKey: config.apiKey,
+      upstreamMessagesUrl,
+      upstreamModelsUrl,
+      anthropicVersion: config.anthropicVersion ?? '2023-06-01',
+      anthropicBeta: config.anthropicBeta,
+      defaultModel: config.defaultModel ?? 'claude-sonnet-4-5',
+      modelMappings: config.modelMappings ?? {},
+      claudeBillingHeaderMode: config.claudeBillingHeaderMode ?? 'strip_line',
+      primaryEndpoint,
+      fallbackEndpoints,
+      allEndpoints: [primaryEndpoint, ...fallbackEndpoints],
+      adminAllowHost: false,
+      endpointTimeoutCooldownMs: config.endpointTimeoutCooldownMs ?? 120000,
+      endpointInvalidResponseCooldownMs: config.endpointInvalidResponseCooldownMs ?? 120000,
+      endpointAuthCooldownMs: config.endpointAuthCooldownMs ?? 1800000,
+      endpointFailureThreshold: config.endpointFailureThreshold ?? 1,
+      endpointHalfOpenMaxProbes: config.endpointHalfOpenMaxProbes ?? 1,
+      maxFallbackAttempts: config.maxFallbackAttempts ?? Math.max(1, fallbackEndpoints.length),
+      maxFallbackTotalMs: config.maxFallbackTotalMs ?? DEFAULT_TIMEOUTS.maxFallbackTotalMs,
+      fallbackConfigPath: '',
+      modelMappingPath: '',
+      upstreamTimeoutMs: config.upstreamTimeoutMs ?? DEFAULT_TIMEOUTS.upstreamTimeoutMs,
+      nonStreamingRequestTimeoutMs: config.nonStreamingRequestTimeoutMs ?? DEFAULT_TIMEOUTS.nonStreamingRequestTimeoutMs,
+      firstByteTimeoutMs: config.firstByteTimeoutMs ?? DEFAULT_TIMEOUTS.firstByteTimeoutMs,
+      firstTextTimeoutMs: config.firstTextTimeoutMs ?? DEFAULT_TIMEOUTS.firstTextTimeoutMs,
+      streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? DEFAULT_TIMEOUTS.streamIdleTimeoutMs,
+      totalRequestTimeoutMs: config.totalRequestTimeoutMs ?? DEFAULT_TIMEOUTS.totalRequestTimeoutMs,
+      maxConcurrentRequests,
+      defaultStreamMode: config.defaultStreamMode ?? 'normalized',
+      fallbackOnRetryable4xx: config.fallbackOnRetryable4xx ?? true,
+      fallbackOnCompat4xx: config.fallbackOnCompat4xx ?? true,
+      compatFallbackPatterns: config.compatFallbackPatterns ?? [],
+      clientErrorPatterns: config.clientErrorPatterns ?? [],
+    },
+    envPath: '',
+    restartRequiredFields: [],
+  };
 
-  return createServer(async (req, res) => {
-    try {
-      if (req.method === 'OPTIONS') {
-        res.writeHead(204, {
-          'access-control-allow-origin': '*',
-          'access-control-allow-methods': 'GET, POST, OPTIONS',
-          'access-control-allow-headers': 'Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta',
-        });
-        res.end();
-        return;
-      }
+  const resolveHandlerOptions = (): AnthropicMessagesHandlerOptions => {
+    const c = getConfig();
+    return {
+      primaryEndpoint: c.primaryEndpoint ?? primaryEndpoint,
+      fallbackEndpoints: c.fallbackEndpoints ?? fallbackEndpoints,
+      anthropicVersion: c.anthropicVersion ?? '2023-06-01',
+      anthropicBeta: c.anthropicBeta,
+      defaultModel: c.defaultModel ?? 'claude-sonnet-4-5',
+      modelMappings: c.modelMappings ?? {},
+      maxFallbackAttempts: c.maxFallbackAttempts ?? Math.max(1, fallbackEndpoints.length),
+      maxFallbackTotalMs: c.maxFallbackTotalMs ?? DEFAULT_TIMEOUTS.maxFallbackTotalMs,
+      endpointHealthStore,
+      upstreamTimeoutMs: c.upstreamTimeoutMs ?? DEFAULT_TIMEOUTS.upstreamTimeoutMs,
+      nonStreamingRequestTimeoutMs: c.nonStreamingRequestTimeoutMs ?? DEFAULT_TIMEOUTS.nonStreamingRequestTimeoutMs,
+      firstByteTimeoutMs: c.firstByteTimeoutMs ?? DEFAULT_TIMEOUTS.firstByteTimeoutMs,
+      firstTextTimeoutMs: c.firstTextTimeoutMs ?? DEFAULT_TIMEOUTS.firstTextTimeoutMs,
+      streamIdleTimeoutMs: c.streamIdleTimeoutMs ?? DEFAULT_TIMEOUTS.streamIdleTimeoutMs,
+      totalRequestTimeoutMs: c.totalRequestTimeoutMs ?? DEFAULT_TIMEOUTS.totalRequestTimeoutMs,
+      defaultStreamMode: c.defaultStreamMode ?? 'normalized',
+      fallbackOnRetryable4xx: c.fallbackOnRetryable4xx ?? true,
+      fallbackOnCompat4xx: c.fallbackOnCompat4xx ?? true,
+      compatFallbackPatterns: c.compatFallbackPatterns ?? [],
+      clientErrorPatterns: c.clientErrorPatterns ?? [],
+      stats,
+    };
+  };
 
-      if (config.adminHandler) {
-        const handled = await config.adminHandler(req, res);
-        if (handled) return;
-      }
+  return createServer((req, res) => {
+    const snap = getLatestSnapshot();
 
-      if (req.method === 'GET' && req.url === '/healthz') {
-        sendJson(res, 200, {
-          ok: true,
-          instanceName,
-          primaryProviderName: config.primaryProviderName,
-          upstreamMessagesUrl,
-          upstreamModelsUrl,
-          anthropicVersion,
-          anthropicBeta: config.anthropicBeta ?? null,
-          modelMappings,
-          claudeBillingHeaderMode: config.claudeBillingHeaderMode,
-          activeRequests: stats.activeRequests,
-          maxConcurrentRequests,
-        } as JsonValue);
-        return;
-      }
-
-      if (req.method === 'GET' && req.url === '/v1/models') {
-        const hasFallback = fallbackEndpoints.length > 0;
-        if (hasFallback) {
-          await handleModelsRequest(req, res, {
-            primaryEndpoint,
-            anthropicVersion,
-            anthropicBeta: config.anthropicBeta,
-            modelMappings,
+    _requestContext.run(snap, async () => {
+      try {
+        if (req.method === 'OPTIONS') {
+          res.writeHead(204, {
+            'access-control-allow-origin': '*',
+            'access-control-allow-methods': 'GET, POST, OPTIONS',
+            'access-control-allow-headers': 'Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta',
           });
-        } else {
-          const upstreamResponse = await fetch(upstreamModelsUrl, {
-            method: 'GET',
-            headers: getOutboundHeaders(config.apiKey, anthropicVersion, config.anthropicBeta, req.headers),
-          });
-          const upstreamText = await upstreamResponse.text();
-          let payload: unknown;
-          try {
-            payload = JSON.parse(upstreamText);
-          } catch {
-            sendJson(res, 502, makeAnthropicError('api_error', 'Upstream models endpoint returned invalid JSON'));
-            return;
-          }
-
-          sendJson(
-            res,
-            upstreamResponse.status,
-            (upstreamResponse.ok ? applyModelMappingsToModelsPayload(payload, modelMappings) : payload) as JsonValue,
-          );
+          res.end();
+          return;
         }
-        return;
-      }
 
-      if (req.method !== 'POST' || req.url !== '/v1/messages') {
-        sendJson(res, 404, makeAnthropicError('not_found_error', 'Supported routes: GET /healthz, GET /v1/models, POST /v1/messages'));
-        return;
-      }
+        if (config.adminHandler) {
+          const handled = await config.adminHandler(req, res);
+          if (handled) return;
+        }
 
-      const contentType = req.headers['content-type'] ?? '';
-      if (!String(contentType).includes('application/json')) {
-        sendJson(res, 415, makeAnthropicError('invalid_request_error', 'Content-Type must be application/json'));
-        return;
-      }
+        if (req.method === 'GET' && req.url === '/healthz') {
+          const c = getConfig();
+          sendJson(res, 200, {
+            ok: true,
+            instanceName,
+            primaryProviderName: c.primaryProviderName,
+            upstreamMessagesUrl: c.upstreamMessagesUrl,
+            upstreamModelsUrl: c.upstreamModelsUrl,
+            anthropicVersion: c.anthropicVersion,
+            anthropicBeta: c.anthropicBeta ?? null,
+            modelMappings: c.modelMappings,
+            claudeBillingHeaderMode: c.claudeBillingHeaderMode,
+            activeRequests: stats.activeRequests,
+            maxConcurrentRequests,
+          } as JsonValue);
+          return;
+        }
 
-      let requestBody: JsonRecord;
-      try {
-        requestBody = await readJsonBody(req);
+        if (req.method === 'GET' && req.url === '/v1/models') {
+          const c = getConfig();
+          const currentFallbackEndpoints = c.fallbackEndpoints ?? fallbackEndpoints;
+          const hasFallback = currentFallbackEndpoints.length > 0;
+          if (hasFallback) {
+            await handleModelsRequest(req, res, {
+              primaryEndpoint: c.primaryEndpoint ?? primaryEndpoint,
+              anthropicVersion: c.anthropicVersion ?? '2023-06-01',
+              anthropicBeta: c.anthropicBeta,
+              modelMappings: c.modelMappings ?? {},
+            });
+          } else {
+            const upstreamResponse = await fetch(c.upstreamModelsUrl, {
+              method: 'GET',
+              headers: getOutboundHeaders(c.apiKey, c.anthropicVersion ?? '2023-06-01', c.anthropicBeta, req.headers),
+            });
+            const upstreamText = await upstreamResponse.text();
+            let payload: unknown;
+            try {
+              payload = JSON.parse(upstreamText);
+            } catch {
+              sendJson(res, 502, makeAnthropicError('api_error', 'Upstream models endpoint returned invalid JSON'));
+              return;
+            }
+
+            sendJson(
+              res,
+              upstreamResponse.status,
+              (upstreamResponse.ok ? applyModelMappingsToModelsPayload(payload, c.modelMappings ?? {}) : payload) as JsonValue,
+            );
+          }
+          return;
+        }
+
+        if (req.method !== 'POST' || req.url !== '/v1/messages') {
+          sendJson(res, 404, makeAnthropicError('not_found_error', 'Supported routes: GET /healthz, GET /v1/models, POST /v1/messages'));
+          return;
+        }
+
+        const contentType = req.headers['content-type'] ?? '';
+        if (!String(contentType).includes('application/json')) {
+          sendJson(res, 415, makeAnthropicError('invalid_request_error', 'Content-Type must be application/json'));
+          return;
+        }
+
+        let requestBody: JsonRecord;
+        try {
+          requestBody = await readJsonBody(req);
+        } catch (error) {
+          sendJson(res, 400, makeAnthropicError('invalid_request_error', `Invalid JSON request body: ${error instanceof Error ? error.message : String(error)}`));
+          return;
+        }
+
+        stats.requestsTotal += 1;
+
+        if (stats.activeRequests >= maxConcurrentRequests) {
+          stats.overloadRejects += 1;
+          sendJson(res, 503, makeAnthropicError('overloaded_error', `Proxy overloaded: ${stats.activeRequests}/${maxConcurrentRequests} active requests`));
+          return;
+        }
+
+        stats.activeRequests += 1;
+        try {
+          await handleMessagesRequest(req, res, requestBody, resolveHandlerOptions());
+        } finally {
+          stats.activeRequests -= 1;
+        }
       } catch (error) {
-        sendJson(res, 400, makeAnthropicError('invalid_request_error', `Invalid JSON request body: ${error instanceof Error ? error.message : String(error)}`));
-        return;
+        sendJson(res, 500, makeAnthropicError('api_error', error instanceof Error ? error.message : String(error)));
       }
-
-      stats.requestsTotal += 1;
-
-      if (stats.activeRequests >= maxConcurrentRequests) {
-        stats.overloadRejects += 1;
-        sendJson(res, 503, makeAnthropicError('overloaded_error', `Proxy overloaded: ${stats.activeRequests}/${maxConcurrentRequests} active requests`));
-        return;
-      }
-
-      stats.activeRequests += 1;
-      try {
-        await handleMessagesRequest(req, res, requestBody, resolveHandlerOptions());
-      } finally {
-        stats.activeRequests -= 1;
-      }
-    } catch (error) {
-      sendJson(res, 500, makeAnthropicError('api_error', error instanceof Error ? error.message : String(error)));
-    }
+    });
   });
 }
 
@@ -318,7 +388,9 @@ export function createConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Anthr
 if (import.meta.url === `file://${process.argv[1]}`) {
   const envPath = process.env.PROXY_ENV_PATH ?? resolve('.env');
   const runtimeStore = createRuntimeConfigStore({ envPath, mode: 'anthropic' });
+  _runtimeStore = runtimeStore;
   const snap = runtimeStore.getSnapshot();
+  _initialSnapshot = snap;
   const endpointHealthStore = createEndpointHealthStore({
     endpointTimeoutCooldownMs: snap.config.endpointTimeoutCooldownMs,
     endpointInvalidResponseCooldownMs: snap.config.endpointInvalidResponseCooldownMs,
