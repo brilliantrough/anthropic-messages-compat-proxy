@@ -66,6 +66,10 @@ export type AnthropicProxyConfig = {
   totalRequestTimeoutMs?: number;
   maxConcurrentRequests?: number;
   defaultStreamMode?: StreamMode;
+  fallbackOnRetryable4xx?: boolean;
+  fallbackOnCompat4xx?: boolean;
+  compatFallbackPatterns?: string[];
+  clientErrorPatterns?: string[];
   adminHandler?: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<boolean>;
   endpointHealthStore?: EndpointHealthStore;
   stats?: ProxyStats;
@@ -114,6 +118,10 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
     streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? DEFAULT_TIMEOUTS.streamIdleTimeoutMs,
     totalRequestTimeoutMs: config.totalRequestTimeoutMs ?? DEFAULT_TIMEOUTS.totalRequestTimeoutMs,
     defaultStreamMode: config.defaultStreamMode ?? 'normalized',
+    fallbackOnRetryable4xx: config.fallbackOnRetryable4xx ?? true,
+    fallbackOnCompat4xx: config.fallbackOnCompat4xx ?? true,
+    compatFallbackPatterns: config.compatFallbackPatterns ?? [],
+    clientErrorPatterns: config.clientErrorPatterns ?? [],
     stats,
   });
 

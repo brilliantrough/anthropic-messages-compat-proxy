@@ -15,6 +15,8 @@ export type AnthropicEndpointFailureReason =
   | 'stream_no_usable_content'
   | 'stream_missing_usage'
   | 'empty_response'
+  | 'sse_reconstruction_failure'
+  | 'proxy_unhandled_error'
   | 'unknown_upstream_error';
 
 export type EndpointCircuitState = 'closed' | 'open' | 'half_open';

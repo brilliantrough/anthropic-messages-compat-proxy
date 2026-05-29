@@ -117,6 +117,10 @@ export type AnthropicMessagesHandlerOptions = {
   streamIdleTimeoutMs: number;
   totalRequestTimeoutMs: number;
   defaultStreamMode: StreamMode;
+  fallbackOnRetryable4xx: boolean;
+  fallbackOnCompat4xx: boolean;
+  compatFallbackPatterns: string[];
+  clientErrorPatterns: string[];
   stats: ProxyStats;
 };
 
@@ -616,7 +620,12 @@ export async function handleMessagesRequest(
     }
 
     if (!upstreamResponse.ok) {
-      const fallbackReason = getAnthropicFallbackReason(upstreamResponse.status);
+      const fallbackReason = getAnthropicFallbackReason(upstreamResponse.status, payload, {
+        fallbackOnRetryable4xx: options.fallbackOnRetryable4xx,
+        fallbackOnCompat4xx: options.fallbackOnCompat4xx,
+        compatFallbackPatterns: options.compatFallbackPatterns,
+        clientErrorPatterns: options.clientErrorPatterns,
+      });
       options.endpointHealthStore.releaseEndpointProbe(endpoint);
       if (fallbackReason) {
         options.endpointHealthStore.markEndpointFailure(endpoint, fallbackReason);

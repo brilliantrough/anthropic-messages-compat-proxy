@@ -49,6 +49,10 @@ export type AnthropicRuntimeConfig = {
   totalRequestTimeoutMs: number;
   maxConcurrentRequests: number;
   defaultStreamMode: StreamMode;
+  fallbackOnRetryable4xx: boolean;
+  fallbackOnCompat4xx: boolean;
+  compatFallbackPatterns: string[];
+  clientErrorPatterns: string[];
 };
 
 function parseStreamMode(value: string | undefined): StreamMode {
@@ -58,6 +62,16 @@ function parseStreamMode(value: string | undefined): StreamMode {
 
 function normalizeBaseUrl(baseUrl: string) {
   return baseUrl.replace(/\/+$/, '');
+}
+
+function parseEnvList(value: string | undefined, defaults: string[]): string[] {
+  if (value === undefined || value.trim() === '') {
+    return defaults;
+  }
+  return value
+    .split(/[,\n]/)
+    .map(item => item.trim())
+    .filter(item => item.length > 0);
 }
 
 function parseClaudeBillingHeaderMode(value: string | undefined): ClaudeBillingHeaderMode {
@@ -222,6 +236,30 @@ export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntim
   const maxConcurrentRequests = Number(env.PROXY_MAX_CONCURRENT_REQUESTS ?? 128);
   const defaultStreamMode = parseStreamMode(env.PROXY_STREAM_MODE);
 
+  const fallbackOnRetryable4xx = isEnabled(env.PROXY_FALLBACK_ON_RETRYABLE_4XX, true);
+  const fallbackOnCompat4xx = isEnabled(env.PROXY_FALLBACK_ON_COMPAT_4XX, true);
+  const defaultCompatFallbackPatterns = [
+    'model not found',
+    'unsupported model',
+    '未配置模型',
+    'does not support',
+    'unsupported parameter',
+    'store must be false',
+  ];
+  const defaultClientErrorPatterns = [
+    'invalid json',
+    'maximum context length',
+    'context length exceeded',
+    'too many input tokens',
+    'invalid tool schema',
+    'json schema is invalid',
+  ];
+  const compatFallbackPatterns = parseEnvList(env.PROXY_FALLBACK_COMPAT_PATTERNS, defaultCompatFallbackPatterns);
+  const clientErrorPatterns = parseEnvList(
+    env.PROXY_NO_FALLBACK_CLIENT_ERROR_PATTERNS ?? env.PROXY_FALLBACK_CLIENT_ERROR_PATTERNS,
+    defaultClientErrorPatterns,
+  );
+
   const primaryEndpoint: UpstreamEndpoint = {
     name: primaryProviderName,
     url: upstreamMessagesUrl,
@@ -267,5 +305,9 @@ export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntim
     totalRequestTimeoutMs,
     maxConcurrentRequests,
     defaultStreamMode,
+    fallbackOnRetryable4xx,
+    fallbackOnCompat4xx,
+    compatFallbackPatterns,
+    clientErrorPatterns,
   };
 }
