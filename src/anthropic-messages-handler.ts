@@ -181,6 +181,7 @@ async function pipeProgressiveSse(
   let wroteTextContent = false;
   let startedStreaming = false;
   const pendingEvents: SseEvent[] = [];
+  const pendingRawChunks: string[] = [];
   let accumulatedUsage: AnthropicStreamUsage | undefined;
 
   const ensureHeaders = () => {
@@ -196,10 +197,16 @@ async function pipeProgressiveSse(
   const flushPending = () => {
     ensureHeaders();
     startedStreaming = true;
-    for (const event of pendingEvents) {
-      res.write(formatSseEvent(normalizeAnthropicStreamEvent(event, requestedModel)));
+    if (streamMode === 'raw') {
+      const raw = pendingRawChunks.join('');
+      if (raw.length > 0) res.write(raw);
+      pendingRawChunks.length = 0;
+    } else {
+      for (const event of pendingEvents) {
+        res.write(formatSseEvent(normalizeAnthropicStreamEvent(event, requestedModel)));
+      }
+      pendingEvents.length = 0;
     }
-    pendingEvents.length = 0;
   };
 
   if (!upstreamResponse.body) {
@@ -253,11 +260,44 @@ async function pipeProgressiveSse(
       }
 
       if (streamMode === 'raw') {
-        ensureHeaders();
-        startedStreaming = true;
-        res.write(Buffer.from(value));
-        wroteTextContent = true;
-        pending = '';
+        const textChunk = decoder.decode(value, { stream: true });
+        pending += textChunk;
+
+        const blocks = pending.split(/\r?\n\r?\n/);
+        pending = blocks.pop() ?? '';
+
+        let rawHasUsableContent = wroteTextContent;
+
+        for (const block of blocks) {
+          const sseEvent = parseSseChunk(block);
+          const payload = parseStreamPayload(sseEvent.data);
+
+          const usage = extractAnthropicUsageFromStreamPayload(payload);
+          if (usage) {
+            accumulatedUsage = { ...accumulatedUsage, ...usage };
+          }
+
+          if (!rawHasUsableContent && isAnthropicStreamEventWithUsableContent(sseEvent)) {
+            rawHasUsableContent = true;
+          }
+
+          pendingRawChunks.push(block + '\r\n\r\n');
+        }
+
+        if (rawHasUsableContent && !wroteTextContent) {
+          if (firstTextTimer) {
+            clearTimeout(firstTextTimer);
+            firstTextTimer = undefined;
+          }
+          wroteTextContent = true;
+          flushPending();
+        } else if (wroteTextContent) {
+          const raw = pendingRawChunks.join('');
+          pendingRawChunks.length = 0;
+          ensureHeaders();
+          res.write(raw);
+        }
+
         continue;
       }
 
