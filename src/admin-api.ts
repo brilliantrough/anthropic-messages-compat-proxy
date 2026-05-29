@@ -276,7 +276,13 @@ export function createAdminHandler(options: AdminHandlerOptions) {
           cachedResponses: options.responseCacheSize ? options.responseCacheSize() : 0,
         });
       } else {
-        sendJson(res, 200, { ok: true });
+        sendJson(res, 501, {
+          ok: false,
+          error: {
+            message: 'Response cache is not configured for this protocol',
+            type: 'not_implemented',
+          },
+        });
       }
       return true;
     }

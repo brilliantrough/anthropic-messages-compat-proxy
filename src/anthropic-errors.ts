@@ -3,9 +3,13 @@ import { isJsonRecord } from './responses-input-normalization.js';
 export type AnthropicFallbackReason =
   | 'upstream_5xx'
   | 'retryable_4xx'
+  | 'compat_4xx'
   | 'connect_error'
-  | 'empty_response'
+  | 'connect_timeout'
+  | 'headers_only_timeout'
   | 'stream_no_usable_content'
+  | 'stream_missing_usage'
+  | 'empty_response'
   | 'unknown_upstream_error';
 
 export function getAnthropicFallbackReason(
@@ -17,6 +21,14 @@ export function getAnthropicFallbackReason(
 
   if ([408, 429].includes(status)) {
     return 'retryable_4xx';
+  }
+
+  if ([401, 403].includes(status)) {
+    return 'compat_4xx';
+  }
+
+  if (status >= 400 && status < 500) {
+    return 'compat_4xx';
   }
 
   return undefined;

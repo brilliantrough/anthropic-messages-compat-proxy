@@ -2,6 +2,15 @@ import { isJsonRecord, type JsonRecord } from './responses-input-normalization.j
 
 export type SseEvent = { event: string; data: string };
 
+export type AnthropicStreamUsage = {
+  messageId?: string;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+};
+
 const anthropicEventTypes = new Set([
   'message_start',
   'content_block_start',
@@ -275,4 +284,96 @@ export function synthesizeAnthropicMessageFromEvents(events: SseEvent[], request
     model: requestedModel ?? message.model,
     content: contentBlocks.filter(Boolean),
   } as JsonRecord;
+}
+
+export function normalizeAnthropicStreamEvent(event: SseEvent, requestedModel: string): SseEvent {
+  if (event.event !== 'message_start') {
+    return event;
+  }
+
+  const payload = parseStreamPayload(event.data);
+  if (!isJsonRecord(payload) || !isJsonRecord(payload.message)) {
+    return event;
+  }
+
+  const normalizedPayload = {
+    ...payload,
+    message: {
+      ...payload.message,
+      model: requestedModel,
+    },
+  };
+
+  return {
+    event: event.event,
+    data: JSON.stringify(normalizedPayload),
+  };
+}
+
+export function makeAnthropicStreamError(message: string, type: string): SseEvent {
+  return {
+    event: 'error',
+    data: JSON.stringify({
+      type: 'error',
+      error: { type, message },
+    }),
+  };
+}
+
+/**
+ * Extract usage from a single stream event payload.
+ * For message_start: extracts from payload.message.usage
+ * For message_delta: extracts from payload.usage
+ */
+export function extractAnthropicUsageFromStreamPayload(payload: unknown): AnthropicStreamUsage | undefined {
+  if (!isJsonRecord(payload)) return undefined;
+
+  // message_start: { type: "message_start", message: { ..., usage: {...} } }
+  if (payload.type === 'message_start' && isJsonRecord(payload.message)) {
+    const messageUsage = payload.message.usage;
+    if (!isJsonRecord(messageUsage)) return undefined;
+
+    const result: AnthropicStreamUsage = {};
+    if (typeof payload.message.id === 'string') result.messageId = payload.message.id;
+    if (typeof payload.message.model === 'string') result.model = payload.message.model;
+
+    const inputTokens = messageUsage.input_tokens;
+    const outputTokens = messageUsage.output_tokens;
+    const cacheReadInputTokens = messageUsage.cache_read_input_tokens;
+    const cacheCreationInputTokens = messageUsage.cache_creation_input_tokens;
+
+    if (typeof inputTokens === 'number') result.inputTokens = inputTokens;
+    if (typeof outputTokens === 'number') result.outputTokens = outputTokens;
+    if (typeof cacheReadInputTokens === 'number') result.cacheReadInputTokens = cacheReadInputTokens;
+    if (typeof cacheCreationInputTokens === 'number') result.cacheCreationInputTokens = cacheCreationInputTokens;
+
+    return result;
+  }
+
+  // message_delta: { type: "message_delta", delta: {...}, usage: {...} }
+  if (payload.type === 'message_delta' && isJsonRecord(payload.usage)) {
+    const usage = payload.usage;
+    const result: AnthropicStreamUsage = {};
+
+    const inputTokens = usage.input_tokens;
+    const outputTokens = usage.output_tokens;
+    const cacheReadInputTokens = usage.cache_read_input_tokens;
+    const cacheCreationInputTokens = usage.cache_creation_input_tokens;
+
+    if (typeof inputTokens === 'number') result.inputTokens = inputTokens;
+    if (typeof outputTokens === 'number') result.outputTokens = outputTokens;
+    if (typeof cacheReadInputTokens === 'number') result.cacheReadInputTokens = cacheReadInputTokens;
+    if (typeof cacheCreationInputTokens === 'number') result.cacheCreationInputTokens = cacheCreationInputTokens;
+
+    return result;
+  }
+
+  return undefined;
+}
+
+export function hasAnthropicStreamUsage(events: SseEvent[]): boolean {
+  return events.some(event => {
+    const payload = parseStreamPayload(event.data);
+    return extractAnthropicUsageFromStreamPayload(payload) !== undefined;
+  });
 }

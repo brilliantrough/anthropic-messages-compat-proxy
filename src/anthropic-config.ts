@@ -4,6 +4,8 @@ import { parse as dotenvParse } from 'dotenv';
 import type { ClaudeBillingHeaderMode } from './responses-input-normalization.js';
 import { isEnabled } from './proxy-config.js';
 
+export type StreamMode = 'normalized' | 'raw';
+
 export type UpstreamEndpoint = {
   name: string;
   url: string;
@@ -39,7 +41,20 @@ export type AnthropicRuntimeConfig = {
   maxFallbackTotalMs: number;
   fallbackConfigPath: string;
   modelMappingPath: string;
+  upstreamTimeoutMs: number;
+  nonStreamingRequestTimeoutMs: number;
+  firstByteTimeoutMs: number;
+  firstTextTimeoutMs: number;
+  streamIdleTimeoutMs: number;
+  totalRequestTimeoutMs: number;
+  maxConcurrentRequests: number;
+  defaultStreamMode: StreamMode;
 };
+
+function parseStreamMode(value: string | undefined): StreamMode {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === 'raw' ? 'raw' : 'normalized';
+}
 
 function normalizeBaseUrl(baseUrl: string) {
   return baseUrl.replace(/\/+$/, '');
@@ -198,6 +213,15 @@ export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntim
   const maxFallbackAttempts = Number(env.PROXY_MAX_FALLBACK_ATTEMPTS ?? Math.max(1, fallbackEndpoints.length));
   const maxFallbackTotalMs = Number(env.PROXY_MAX_FALLBACK_TOTAL_MS ?? 30000);
 
+  const upstreamTimeoutMs = Number(env.PROXY_UPSTREAM_TIMEOUT_MS ?? 30000);
+  const nonStreamingRequestTimeoutMs = Number(env.PROXY_NON_STREAM_TIMEOUT_MS ?? 300000);
+  const firstByteTimeoutMs = Number(env.PROXY_FIRST_BYTE_TIMEOUT_MS ?? 30000);
+  const firstTextTimeoutMs = Number(env.PROXY_FIRST_TEXT_TIMEOUT_MS ?? 12000);
+  const streamIdleTimeoutMs = Number(env.PROXY_STREAM_IDLE_TIMEOUT_MS ?? 60000);
+  const totalRequestTimeoutMs = Number(env.PROXY_TOTAL_REQUEST_TIMEOUT_MS ?? 600000);
+  const maxConcurrentRequests = Number(env.PROXY_MAX_CONCURRENT_REQUESTS ?? 128);
+  const defaultStreamMode = parseStreamMode(env.PROXY_STREAM_MODE);
+
   const primaryEndpoint: UpstreamEndpoint = {
     name: primaryProviderName,
     url: upstreamMessagesUrl,
@@ -235,5 +259,13 @@ export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntim
     maxFallbackTotalMs,
     fallbackConfigPath: resolve(fallbackPath),
     modelMappingPath: resolve(modelMapPath),
+    upstreamTimeoutMs,
+    nonStreamingRequestTimeoutMs,
+    firstByteTimeoutMs,
+    firstTextTimeoutMs,
+    streamIdleTimeoutMs,
+    totalRequestTimeoutMs,
+    maxConcurrentRequests,
+    defaultStreamMode,
   };
 }

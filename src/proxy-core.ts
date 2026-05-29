@@ -8,9 +8,13 @@ export type AnthropicFallbackBudget = {
 export type AnthropicEndpointFailureReason =
   | 'upstream_5xx'
   | 'retryable_4xx'
+  | 'compat_4xx'
   | 'connect_error'
-  | 'empty_response'
+  | 'connect_timeout'
+  | 'headers_only_timeout'
   | 'stream_no_usable_content'
+  | 'stream_missing_usage'
+  | 'empty_response'
   | 'unknown_upstream_error';
 
 export type EndpointCircuitState = 'closed' | 'open' | 'half_open';
@@ -78,11 +82,11 @@ function getCooldownMsForReason(
     endpointAuthCooldownMs: number;
   },
 ) {
-  if (reason === 'connect_error') {
+  if (reason === 'connect_error' || reason === 'connect_timeout' || reason === 'headers_only_timeout') {
     return config.endpointTimeoutCooldownMs;
   }
 
-  if (reason === 'retryable_4xx') {
+  if (reason === 'retryable_4xx' || reason === 'compat_4xx') {
     return config.endpointAuthCooldownMs;
   }
 
@@ -92,10 +96,14 @@ function getCooldownMsForReason(
 function shouldOpenCircuitImmediately(reason: AnthropicEndpointFailureReason) {
   return [
     'connect_error',
+    'connect_timeout',
+    'headers_only_timeout',
     'retryable_4xx',
+    'compat_4xx',
     'upstream_5xx',
     'empty_response',
     'stream_no_usable_content',
+    'stream_missing_usage',
     'unknown_upstream_error',
   ].includes(reason);
 }
