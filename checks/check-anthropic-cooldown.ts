@@ -8,6 +8,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { getAvailablePort } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -112,7 +113,7 @@ async function main() {
     throw new Error('Failed to resolve mock server addresses');
   }
 
-  const proxyPort = fallbackAddress.port + 1;
+  const proxyPort = await getAvailablePort();
   const fallbackConfigPath = path.join(tempDir, 'fallback.json');
   await writeFile(
     fallbackConfigPath,
@@ -146,7 +147,9 @@ async function main() {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
+  const stdout: string[] = [];
   const stderr: string[] = [];
+  proxy.stdout.on('data', chunk => stdout.push(String(chunk)));
   proxy.stderr.on('data', chunk => stderr.push(String(chunk)));
 
   try {
@@ -188,6 +191,10 @@ async function main() {
     assert.equal(secondBody.id, 'msg_fallback_ok');
     assert.equal(primaryRequests, 1, 'primary should be skipped during cooldown');
     assert.equal(fallbackRequests, 2);
+
+    const stdoutText = stdout.join('');
+    assert.match(stdoutText, /endpoint circuit opened/, 'expected circuit open log');
+    assert.match(stdoutText, /skipping upstream during circuit cooldown/, 'expected cooldown skip log');
 
     console.log('Anthropic cooldown check passed.');
   } finally {

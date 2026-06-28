@@ -11,8 +11,9 @@ export type AnthropicEndpointFailureReason =
   | 'compat_4xx'
   | 'connect_error'
   | 'connect_timeout'
+  | 'body_timeout'
   | 'headers_only_timeout'
-  | 'stream_no_usable_content'
+  | 'stream_no_text_content'
   | 'stream_missing_usage'
   | 'empty_response'
   | 'sse_reconstruction_failure'
@@ -84,7 +85,7 @@ function getCooldownMsForReason(
     endpointAuthCooldownMs: number;
   },
 ) {
-  if (reason === 'connect_error' || reason === 'connect_timeout' || reason === 'headers_only_timeout') {
+  if (reason === 'connect_error' || reason === 'connect_timeout' || reason === 'body_timeout' || reason === 'headers_only_timeout') {
     return config.endpointTimeoutCooldownMs;
   }
 
@@ -99,12 +100,13 @@ function shouldOpenCircuitImmediately(reason: AnthropicEndpointFailureReason) {
   return [
     'connect_error',
     'connect_timeout',
+    'body_timeout',
     'headers_only_timeout',
     'retryable_4xx',
     'compat_4xx',
     'upstream_5xx',
     'empty_response',
-    'stream_no_usable_content',
+    'stream_no_text_content',
     'stream_missing_usage',
     'unknown_upstream_error',
   ].includes(reason);
