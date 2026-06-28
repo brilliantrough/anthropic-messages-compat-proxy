@@ -8,6 +8,19 @@ const MASKED = '***';
 const DEFAULT_ADMIN_ENV: Record<string, string> = {
   ANTHROPIC_VERSION: "2023-06-01",
   PROXY_CLAUDE_BILLING_HEADER_MODE: "strip_line",
+  PROXY_UPSTREAM_TIMEOUT_MS: "30000",
+  PROXY_NON_STREAM_TIMEOUT_MS: "300000",
+  PROXY_FIRST_BYTE_TIMEOUT_MS: "30000",
+  PROXY_FIRST_TEXT_TIMEOUT_MS: "12000",
+  PROXY_STREAM_IDLE_TIMEOUT_MS: "60000",
+  PROXY_TOTAL_REQUEST_TIMEOUT_MS: "600000",
+  PROXY_MAX_CONCURRENT_REQUESTS: "128",
+  PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS: "120000",
+  PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS: "120000",
+  PROXY_ENDPOINT_AUTH_COOLDOWN_MS: "1800000",
+  PROXY_ENDPOINT_FAILURE_THRESHOLD: "1",
+  PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES: "1",
+  PROXY_MAX_FALLBACK_TOTAL_MS: "30000",
 };
 
 type SecretEnvAction = 'keep' | 'replace' | 'clear';
@@ -141,6 +154,12 @@ export function readForAdmin(store: ConfigFileStore): AdminConfigView {
   const envParsed = parseDotEnvFile(store.envPath);
   const fallbackParsed = parseFallbackFile(store.fallbackPath);
   const modelMappings = parseModelMapFile(store.modelMapPath);
+  const fallbackProviderCount = Array.isArray(fallbackParsed.fallback_api_config)
+    ? fallbackParsed.fallback_api_config.length
+    : 0;
+  const derivedAdminEnv: Record<string, string> = {
+    PROXY_MAX_FALLBACK_ATTEMPTS: String(Math.max(1, fallbackProviderCount)),
+  };
 
   const env: EnvEntry[] = Object.entries(envParsed).map(([key, value]) => ({
     key,
@@ -148,7 +167,7 @@ export function readForAdmin(store: ConfigFileStore): AdminConfigView {
     secret: isSecretKey(key),
   }));
 
-  for (const [key, value] of Object.entries(DEFAULT_ADMIN_ENV)) {
+  for (const [key, value] of Object.entries({ ...DEFAULT_ADMIN_ENV, ...derivedAdminEnv })) {
     if (!(key in envParsed)) {
       env.push({ key, value, secret: false });
     }

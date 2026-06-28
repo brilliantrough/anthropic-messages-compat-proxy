@@ -49,6 +49,12 @@ export type AnthropicRuntimeConfig = {
   totalRequestTimeoutMs: number;
   maxConcurrentRequests: number;
   defaultStreamMode: StreamMode;
+  logRequestBodies: boolean;
+  debugSse: boolean;
+  sseFailureDebugEnabled: boolean;
+  sseFailureDebugDir: string;
+  streamMissingUsageDebugEnabled: boolean;
+  streamMissingUsageDebugDir: string;
   fallbackOnRetryable4xx: boolean;
   fallbackOnCompat4xx: boolean;
   compatFallbackPatterns: string[];
@@ -235,6 +241,14 @@ export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntim
   const totalRequestTimeoutMs = Number(env.PROXY_TOTAL_REQUEST_TIMEOUT_MS ?? 600000);
   const maxConcurrentRequests = Number(env.PROXY_MAX_CONCURRENT_REQUESTS ?? 128);
   const defaultStreamMode = parseStreamMode(env.PROXY_STREAM_MODE);
+  const logRequestBodies = isEnabled(env.PROXY_LOG_REQUEST_BODY);
+  const debugSse = isEnabled(env.PROXY_DEBUG_SSE);
+  const sseFailureDebugEnabled = isEnabled(env.PROXY_SSE_FAILURE_DEBUG);
+  const sseFailureDebugDir = resolve(env.PROXY_SSE_FAILURE_DIR ?? join(configDir, 'captures', instanceName, 'sse-failures'));
+  const streamMissingUsageDebugEnabled = isEnabled(env.PROXY_STREAM_MISSING_USAGE_DEBUG);
+  const streamMissingUsageDebugDir = resolve(
+    env.PROXY_STREAM_MISSING_USAGE_DIR ?? join(configDir, 'captures', instanceName, 'stream', 'missing-usage'),
+  );
 
   const fallbackOnRetryable4xx = isEnabled(env.PROXY_FALLBACK_ON_RETRYABLE_4XX, true);
   const fallbackOnCompat4xx = isEnabled(env.PROXY_FALLBACK_ON_COMPAT_4XX, true);
@@ -305,6 +319,12 @@ export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntim
     totalRequestTimeoutMs,
     maxConcurrentRequests,
     defaultStreamMode,
+    logRequestBodies,
+    debugSse,
+    sseFailureDebugEnabled,
+    sseFailureDebugDir,
+    streamMissingUsageDebugEnabled,
+    streamMissingUsageDebugDir,
     fallbackOnRetryable4xx,
     fallbackOnCompat4xx,
     compatFallbackPatterns,

@@ -43,6 +43,26 @@ PRIMARY_PROVIDER_DEFAULT_MODEL=claude-sonnet-4-5
 ANTHROPIC_VERSION=2023-06-01
 ```
 
+Recommended runtime timeout / fallback settings:
+
+```env
+PROXY_UPSTREAM_TIMEOUT_MS=30000
+PROXY_NON_STREAM_TIMEOUT_MS=300000
+PROXY_FIRST_BYTE_TIMEOUT_MS=30000
+PROXY_FIRST_TEXT_TIMEOUT_MS=12000
+PROXY_STREAM_IDLE_TIMEOUT_MS=60000
+PROXY_TOTAL_REQUEST_TIMEOUT_MS=600000
+PROXY_MAX_CONCURRENT_REQUESTS=128
+PROXY_MAX_FALLBACK_TOTAL_MS=30000
+PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS=120000
+PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS=120000
+PROXY_ENDPOINT_AUTH_COOLDOWN_MS=1800000
+PROXY_ENDPOINT_FAILURE_THRESHOLD=1
+PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES=1
+```
+
+Leave `PROXY_MAX_FALLBACK_ATTEMPTS` unset unless you intentionally want to override the default derived behavior. When omitted, the proxy derives it as `max(1, fallback provider count)`.
+
 Build and start the proxy with that instance configuration loaded:
 
 ```bash
@@ -118,6 +138,23 @@ PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line
 npm run check
 npm run build
 ```
+
+## Runtime Timeout & Fallback Knobs
+
+- `PROXY_UPSTREAM_TIMEOUT_MS` - connect timeout for streaming upstream requests, default `30000`
+- `PROXY_NON_STREAM_TIMEOUT_MS` - connect timeout for non-stream requests, default `300000`
+- `PROXY_FIRST_BYTE_TIMEOUT_MS` - max wait for first upstream body chunk, default `30000`
+- `PROXY_FIRST_TEXT_TIMEOUT_MS` - max wait for first usable stream content, default `12000`
+- `PROXY_STREAM_IDLE_TIMEOUT_MS` - max idle gap between upstream stream chunks, default `60000`
+- `PROXY_TOTAL_REQUEST_TIMEOUT_MS` - total request lifetime cap, default `600000`
+- `PROXY_MAX_CONCURRENT_REQUESTS` - local active-request ceiling, default `128`
+- `PROXY_MAX_FALLBACK_ATTEMPTS` - max number of fallback endpoint tries per request; leave unset for the default `max(1, fallback provider count)` behavior, or set it explicitly to override
+- `PROXY_MAX_FALLBACK_TOTAL_MS` - total wall-clock fallback budget per request, default `30000`
+- `PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS` - cooldown after timeout-style failures, default `120000`
+- `PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS` - cooldown after invalid-response failures, default `120000`
+- `PROXY_ENDPOINT_AUTH_COOLDOWN_MS` - cooldown after retryable/auth-style upstream failures, default `1800000`
+- `PROXY_ENDPOINT_FAILURE_THRESHOLD` - failures needed before opening the circuit when the reason is not immediate-open, default `1`
+- `PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES` - concurrent half-open probe limit, default `1`
 
 ## Current Scope
 
