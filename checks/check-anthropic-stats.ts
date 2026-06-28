@@ -6,6 +6,9 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import { getAvailablePort } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -23,6 +26,7 @@ async function waitForHealthy(url: string) {
 }
 
 async function main() {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'anthropic-proxy-stats-'));
   const primary = createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/messages') {
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
@@ -56,7 +60,9 @@ async function main() {
     throw new Error('Failed to resolve mock server address');
   }
 
-  const proxyPort = primaryAddress.port + 1;
+  const proxyPort = await getAvailablePort();
+  const fallbackConfigPath = path.join(tempDir, 'fallback.json');
+  await writeFile(fallbackConfigPath, JSON.stringify({ fallback_api_config: [] }, null, 2), 'utf8');
 
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
@@ -65,11 +71,16 @@ async function main() {
       ...process.env,
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
-      INSTANCE_NAME: 'anthropic-proxy-stats-check',
-      PRIMARY_PROVIDER_NAME: 'primary',
-      PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
-      PRIMARY_PROVIDER_API_KEY: 'test-key',
-    },
+        INSTANCE_NAME: 'anthropic-proxy-stats-check',
+        PRIMARY_PROVIDER_NAME: 'primary',
+        PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
+        PRIMARY_PROVIDER_API_KEY: 'test-key',
+        FALLBACK_CONFIG_PATH: fallbackConfigPath,
+        PROXY_SSE_FAILURE_DEBUG: '1',
+        PROXY_SSE_FAILURE_DIR: path.join(tempDir, 'sse-failures'),
+        PROXY_STREAM_MISSING_USAGE_DEBUG: '1',
+        PROXY_STREAM_MISSING_USAGE_DIR: path.join(tempDir, 'missing-usage'),
+      },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -99,6 +110,16 @@ async function main() {
 
     // Verify basic structure exists
     assert.ok(stats.instanceName, 'stats should have instanceName');
+    assert.equal(stats.host, '127.0.0.1', 'stats should expose host');
+    assert.equal(stats.port, proxyPort, 'stats should expose port');
+    assert.equal(stats.primaryProviderName, 'primary', 'stats should expose primaryProviderName');
+    assert.equal(stats.activeRequests, 0, 'stats should expose top-level activeRequests');
+    assert.equal(stats.fallbackConfigPath, fallbackConfigPath, 'stats should expose fallbackConfigPath');
+    assert.ok(Array.isArray(stats.fallbackNames), 'stats should expose fallbackNames');
+    assert.equal(stats.sseFailureDebugEnabled, true, 'stats should expose sseFailureDebugEnabled');
+    assert.equal(stats.streamMissingUsageDebugEnabled, true, 'stats should expose streamMissingUsageDebugEnabled');
+    assert.equal(stats.fallbackOnRetryable4xx, true, 'stats should expose fallbackOnRetryable4xx');
+    assert.equal(stats.fallbackOnCompat4xx, true, 'stats should expose fallbackOnCompat4xx');
     assert.ok(stats.stats !== undefined, 'stats should have nested stats object');
 
     const statsCounters = stats.stats as Record<string, unknown>;
@@ -152,6 +173,7 @@ async function main() {
     ]);
     primary.close();
     await once(primary, 'close');
+    await rm(tempDir, { recursive: true, force: true });
   }
 
   if (stderr.length > 0) {

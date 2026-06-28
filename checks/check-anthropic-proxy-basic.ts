@@ -65,12 +65,12 @@ async function main() {
   const proxyBaseUrl = `http://127.0.0.1:${proxyAddress.port}`;
 
   try {
-    const healthResponse = await fetch(`${proxyBaseUrl}/healthz`);
+    const healthResponse = await fetch(`${proxyBaseUrl}/healthz?verbose=1`);
     assert.equal(healthResponse.status, 200);
     const health = await healthResponse.json() as { upstreamMessagesUrl?: string };
     assert.equal(health.upstreamMessagesUrl, `http://127.0.0.1:${upstreamAddress.port}/v1/messages`);
 
-    const response = await fetch(`${proxyBaseUrl}/v1/messages`, {
+    const response = await fetch(`${proxyBaseUrl}/v1/messages?beta=true`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -98,7 +98,7 @@ async function main() {
       messages: [{ role: 'user', content: 'Hello' }],
     });
 
-    const modelsResponse = await fetch(`${proxyBaseUrl}/v1/models`);
+    const modelsResponse = await fetch(`${proxyBaseUrl}/v1/models?beta=true`);
     assert.equal(modelsResponse.status, 200);
     const models = await modelsResponse.json() as { data?: Array<{ id?: string }> };
     assert.equal(models.data?.some(item => item.id === 'public-claude'), true);
