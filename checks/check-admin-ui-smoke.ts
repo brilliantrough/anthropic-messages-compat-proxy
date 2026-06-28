@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import vm from 'node:vm';
 
 import { createConfigFileStoreFromPaths } from '../src/config-files.js';
 import { createRuntimeConfigStore } from '../src/runtime-config.js';
@@ -27,6 +28,234 @@ function writeFallbackJson(filePath: string, content: unknown) {
 
 function writeModelMapJson(filePath: string, content: unknown) {
   writeFileSync(filePath, JSON.stringify(content, null, 2), 'utf8');
+}
+
+function createElementStub(tagName: string) {
+  const listeners: Record<string, Array<(this: any, event?: unknown) => void>> = {};
+  const attributes: Record<string, string> = {};
+  let value = '';
+  let textContent = '';
+  let innerHTML = '';
+  let className = '';
+  let type = '';
+  let checked = false;
+  const dataset: Record<string, string> = {};
+  const children: any[] = [];
+  const element = {
+    tagName,
+    style: {},
+    dataset,
+    children,
+    appendChild(child: any) {
+      children.push(child);
+      return child;
+    },
+    removeChild(child: any) {
+      var idx = children.indexOf(child);
+      if (idx >= 0) {
+        children.splice(idx, 1);
+      }
+    },
+    addEventListener(typeName: string, handler: (this: any, event?: unknown) => void) {
+      (listeners[typeName] ||= []).push(handler);
+    },
+    dispatch(typeName: string) {
+      const handlers = listeners[typeName] || [];
+      for (const handler of handlers) {
+        handler.call(element, { target: element, type: typeName });
+      }
+    },
+    setAttribute(name: string, val: string) {
+      attributes[name] = val;
+      if (name === 'id') {
+        (element as any).id = val;
+      }
+    },
+    getAttribute(name: string) {
+      return attributes[name];
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    },
+  } as any;
+
+  Object.defineProperty(element, 'value', {
+    get() { return value; },
+    set(v) { value = String(v); },
+  });
+  Object.defineProperty(element, 'textContent', {
+    get() { return textContent; },
+    set(v) { textContent = String(v); },
+  });
+  Object.defineProperty(element, 'innerHTML', {
+    get() { return innerHTML; },
+    set(v) {
+      innerHTML = String(v);
+      children.length = 0;
+    },
+  });
+  Object.defineProperty(element, 'className', {
+    get() { return className; },
+    set(v) { className = String(v); },
+  });
+  Object.defineProperty(element, 'type', {
+    get() { return type; },
+    set(v) { type = String(v); },
+  });
+  Object.defineProperty(element, 'checked', {
+    get() { return checked; },
+    set(v) { checked = Boolean(v); },
+  });
+  return element;
+}
+
+async function evaluateAdminJsForModelMapping(js: string) {
+  let capturedSaveBody = '';
+  const elementMap = new Map<string, any>();
+  const list = createElementStub('div');
+  const status = createElementStub('div');
+  const dirtyBadge = createElementStub('div');
+  const restartNotice = createElementStub('div');
+  const actionResult = createElementStub('div');
+  const validationResult = createElementStub('div');
+  const runtimeTbody = createElementStub('tbody');
+  const primaryTbody = createElementStub('tbody');
+  const fallbackTbody = createElementStub('tbody');
+  const btnAddMapping = createElementStub('button');
+  const btnSave = createElementStub('button');
+  const btnAddFallback = createElementStub('button');
+  const btnValidate = createElementStub('button');
+  const btnReload = createElementStub('button');
+  const btnRollback = createElementStub('button');
+
+  [
+    ['model-mappings-list', list],
+    ['status', status],
+    ['dirty-badge', dirtyBadge],
+    ['restart-notice', restartNotice],
+    ['action-result', actionResult],
+    ['validation-result', validationResult],
+    ['btn-add-mapping', btnAddMapping],
+    ['btn-save', btnSave],
+    ['btn-add-fallback', btnAddFallback],
+    ['btn-validate', btnValidate],
+    ['btn-reload', btnReload],
+    ['btn-rollback', btnRollback],
+  ].forEach(([id, el]) => {
+    el.id = id;
+    elementMap.set(id, el);
+  });
+
+  const tableMap = new Map<string, any>([
+    ['#runtime-table tbody', runtimeTbody],
+    ['#primary-table tbody', primaryTbody],
+    ['#fallback-table tbody', fallbackTbody],
+  ]);
+
+  const adminConfigResponse = {
+    ok: true,
+    runtimeVersion: 1,
+    restartRequiredFields: [],
+    config: {
+      env: [],
+      fallbackProviders: [],
+      modelMappings: {},
+    },
+  };
+
+  const context = {
+    console,
+    setTimeout,
+    clearTimeout,
+    Date,
+    JSON,
+    window: {},
+    document: {
+      createElement(tag: string) {
+        return createElementStub(tag);
+      },
+      createTextNode(text: string) {
+        return { textContent: text };
+      },
+      getElementById(id: string) {
+        const el = elementMap.get(id);
+        if (!el) {
+          throw new Error('Missing element stub for id=' + id);
+        }
+        return el;
+      },
+      querySelector(selector: string) {
+        const el = tableMap.get(selector);
+        if (!el) {
+          throw new Error('Missing selector stub for ' + selector);
+        }
+        return el;
+      },
+    },
+    fetch: async (url: string, options?: { method?: string; body?: string }) => {
+      if (url === '/admin/config' && !options) {
+        return {
+          ok: true,
+          status: 200,
+          async json() { return adminConfigResponse; },
+        };
+      }
+      if (url === '/admin/config' && options?.method === 'PUT') {
+        capturedSaveBody = options.body || '';
+        const parsed = JSON.parse(capturedSaveBody);
+        adminConfigResponse.runtimeVersion += 1;
+        adminConfigResponse.config = {
+          env: [],
+          fallbackProviders: [],
+          modelMappings: parsed.modelMappings,
+        };
+        return {
+          ok: true,
+          status: 200,
+          async json() { return { ok: true, runtimeVersion: adminConfigResponse.runtimeVersion }; },
+        };
+      }
+      if (url === '/admin/config/validate') {
+        return {
+          ok: true,
+          status: 200,
+          async json() { return { ok: true, valid: true, warnings: [] }; },
+        };
+      }
+      if (url === '/admin/config/reload' || url === '/admin/config/rollback') {
+        return {
+          ok: true,
+          status: 200,
+          async json() { return { ok: true, runtimeVersion: adminConfigResponse.runtimeVersion, restored: [] }; },
+        };
+      }
+      throw new Error('Unhandled fetch stub for ' + url + ' ' + (options?.method || 'GET'));
+    },
+  } as any;
+  context.window = context;
+
+  vm.runInNewContext(js, context, { filename: 'admin.js' });
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  btnAddMapping.dispatch('click');
+  assert.equal(list.children.length, 1, 'adding a mapping should render one row');
+  const row = list.children[0];
+  const aliasInput = row.children[0].children[0];
+  const targetInput = row.children[2].children[0];
+
+  aliasInput.value = 'renamed-alias';
+  aliasInput.dispatch('input');
+  targetInput.value = 'claude-sonnet-4-6';
+  targetInput.dispatch('input');
+
+  btnSave.dispatch('click');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  return JSON.parse(capturedSaveBody) as { modelMappings: Record<string, string> };
 }
 
 function startServer(
@@ -126,6 +355,16 @@ async function main() {
     assert.ok(js.includes('disableCooldown'), 'JS should handle fallback disableCooldown');
     assert.ok(js.includes('PROXY_CLAUDE_BILLING_HEADER_MODE'), 'JS should expose Claude billing header mode');
     assert.ok(js.includes('strip_cch'), 'JS should offer strip_cch mode');
+
+    console.log('=== 3b. Add mapping + rename alias + edit target saves one merged mapping ===');
+    {
+      const payload = await evaluateAdminJsForModelMapping(js);
+      assert.deepEqual(
+        payload.modelMappings,
+        { 'renamed-alias': 'claude-sonnet-4-6' },
+        'save payload should contain only the renamed alias mapped to the edited target',
+      );
+    }
 
     console.log('=== 4. CSS has required styles ===');
     const cssRes = await fetch(`${baseUrl}/admin/assets/admin.css`);

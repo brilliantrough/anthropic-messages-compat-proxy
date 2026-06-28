@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -42,6 +42,22 @@ function startServer(
 
 async function main() {
   try {
+    const expectedRuntimeDefaults = {
+      PROXY_UPSTREAM_TIMEOUT_MS: '30000',
+      PROXY_NON_STREAM_TIMEOUT_MS: '300000',
+      PROXY_FIRST_BYTE_TIMEOUT_MS: '30000',
+      PROXY_FIRST_TEXT_TIMEOUT_MS: '12000',
+      PROXY_STREAM_IDLE_TIMEOUT_MS: '60000',
+      PROXY_TOTAL_REQUEST_TIMEOUT_MS: '600000',
+      PROXY_MAX_CONCURRENT_REQUESTS: '128',
+      PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS: '120000',
+      PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS: '120000',
+      PROXY_ENDPOINT_AUTH_COOLDOWN_MS: '1800000',
+      PROXY_ENDPOINT_FAILURE_THRESHOLD: '1',
+      PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES: '1',
+      PROXY_MAX_FALLBACK_TOTAL_MS: '30000',
+    } as const;
+
     console.log('=== 1. Setup with Anthropic env keys in .env ===');
     const configDir = makeTempDir();
     const envPath = path.join(configDir, '.env');
@@ -141,6 +157,112 @@ async function main() {
     const defaultBillingEntry = envArr2.find(e => e.key === 'PROXY_CLAUDE_BILLING_HEADER_MODE');
     assert.ok(defaultBillingEntry, 'PROXY_CLAUDE_BILLING_HEADER_MODE should appear as default');
     assert.equal(defaultBillingEntry.value, 'strip_line');
+
+    console.log('=== 8. Timeout and fallback runtime defaults appear in admin env even when omitted ===');
+    for (const [key, expectedValue] of Object.entries(expectedRuntimeDefaults)) {
+      const entry = envArr2.find(e => e.key === key);
+      assert.ok(entry, `${key} should appear in admin env as a default`);
+      assert.equal(entry.value, expectedValue, `${key} should have default value ${expectedValue}`);
+    }
+
+    const defaultAttemptsEntry = envArr2.find(e => e.key === 'PROXY_MAX_FALLBACK_ATTEMPTS');
+    assert.ok(defaultAttemptsEntry, 'PROXY_MAX_FALLBACK_ATTEMPTS should appear in admin env as a derived default');
+    assert.equal(defaultAttemptsEntry.value, '1', 'PROXY_MAX_FALLBACK_ATTEMPTS should default to 1 when no fallback providers exist');
+
+    console.log('=== 9. Derived fallback-attempt default tracks fallback provider count ===');
+    const configDir3 = makeTempDir();
+    const envPath3 = path.join(configDir3, '.env');
+    const fallbackPath3 = path.join(configDir3, 'fallback.json');
+    const modelMapPath3 = path.join(configDir3, 'model-map.json');
+
+    writeFileSync(fallbackPath3, JSON.stringify({
+      fallback_api_config: [
+        { name: 'fallback-a', base_url: 'https://fallback-a.example', api_key: 'key-a' },
+        { name: 'fallback-b', base_url: 'https://fallback-b.example', api_key: 'key-b' },
+      ],
+    }, null, 2), 'utf8');
+    writeFileSync(modelMapPath3, JSON.stringify({ model_mappings: {} }, null, 2), 'utf8');
+    writeFileSync(envPath3, [
+      'PRIMARY_PROVIDER_NAME=anthropic-test',
+      'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.test',
+      'PRIMARY_PROVIDER_API_KEY=test-key-789',
+      `FALLBACK_CONFIG_PATH=${fallbackPath3}`,
+      `MODEL_MAP_PATH=${modelMapPath3}`,
+    ].join('\n'), 'utf8');
+
+    const runtimeStore3 = createRuntimeConfigStore({ envPath: envPath3, mode: 'anthropic' });
+    const snap3 = runtimeStore3.getSnapshot();
+    const configStore3 = createConfigFileStoreFromPaths({
+      envPath: envPath3,
+      fallbackPath: snap3.config.fallbackConfigPath,
+      modelMapPath: snap3.config.modelMappingPath,
+    });
+    const adminHandler3 = createAdminHandler({ configStore: configStore3, runtimeStore: runtimeStore3 });
+    const { port: port3 } = await startServer(adminHandler3);
+    const baseUrl3 = `http://127.0.0.1:${port3}`;
+
+    const configRes3 = await fetch(`${baseUrl3}/admin/config`);
+    assert.equal(configRes3.status, 200);
+    const configBody3 = (await configRes3.json()) as Record<string, unknown>;
+    const config3 = configBody3.config as Record<string, unknown>;
+    const envArr3 = config3.env as Array<Record<string, unknown>>;
+    const derivedAttemptsEntry = envArr3.find(e => e.key === 'PROXY_MAX_FALLBACK_ATTEMPTS');
+    assert.ok(derivedAttemptsEntry, 'PROXY_MAX_FALLBACK_ATTEMPTS should appear with fallback providers present');
+    assert.equal(derivedAttemptsEntry.value, '2', 'PROXY_MAX_FALLBACK_ATTEMPTS should default to fallback provider count when env is omitted');
+
+    console.log('=== 10. Admin runtime table allowlist includes fallback/timeout entries ===');
+    const adminJs = readFileSync(path.resolve(import.meta.dirname, '..', 'public', 'admin', 'assets', 'admin.js'), 'utf8');
+    const requiredRuntimeKeys = [
+      ...Object.keys(expectedRuntimeDefaults),
+      'PROXY_MAX_FALLBACK_ATTEMPTS',
+    ];
+    for (const key of requiredRuntimeKeys) {
+      assert.ok(adminJs.includes(`'${key}'`), `${key} should be included in admin.js runtime allowlist`);
+    }
+
+    console.log('=== 11. HTML renders the redesigned shared admin shell ===');
+    const htmlRes = await fetch(`${baseUrl}/admin`);
+    assert.equal(htmlRes.status, 200);
+    const html = await htmlRes.text();
+    const requiredShellClasses = [
+      'admin-shell',
+      'topbar',
+      'content-grid',
+      'config-column',
+      'status-column',
+    ];
+    for (const cls of requiredShellClasses) {
+      assert.ok(
+        html.includes(cls),
+        `anthropic admin page should render the shared admin shell class "${cls}"`,
+      );
+    }
+
+    console.log('=== 12. HTML renders the redesigned notice and status panel structure ===');
+    assert.ok(
+      html.includes('status-panel'),
+      'anthropic admin page should render the read-only status panel',
+    );
+    assert.ok(
+      html.includes('panel-title'),
+      'anthropic admin page should render compact panel titles',
+    );
+
+    console.log('=== 13. JS uses the redesigned model mapping editor structure ===');
+    assert.ok(
+      adminJs.includes('mapping-row'),
+      'anthropic model mapping renderer should use the redesigned mapping row class',
+    );
+    assert.ok(
+      adminJs.includes('mapping-arrow'),
+      'anthropic model mapping renderer should render the visual mapping arrow',
+    );
+
+    console.log('=== 14. JS uses the redesigned provider/fallback editor structure ===');
+    assert.ok(
+      adminJs.includes('fallback-row'),
+      'anthropic fallback renderer should emit redesigned fallback rows',
+    );
 
     console.log('\nAll anthropic-admin-config-api checks passed.');
   } finally {
