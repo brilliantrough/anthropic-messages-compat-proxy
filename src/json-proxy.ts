@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { bootstrapHttpProxySupport } from './http-proxy-bootstrap.js';
 import { createServer } from 'node:http';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { resolve } from 'node:path';
@@ -39,6 +40,8 @@ import {
 import { createAdminHandler } from './admin-api.js';
 import { createConfigFileStoreFromPaths } from './config-files.js';
 import { createRuntimeConfigStore, createEndpointStateKey, type RuntimeConfigStore, type RuntimeSnapshot } from './runtime-config.js';
+
+bootstrapHttpProxySupport();
 
 const _envPath = process.env.PROXY_ENV_PATH ?? resolve('.env');
 const runtimeStore = createRuntimeConfigStore({ envPath: _envPath });
