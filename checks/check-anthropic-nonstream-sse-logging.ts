@@ -15,49 +15,46 @@ const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
 
 async function waitForHealthy(url: string) {
   const startedAt = Date.now();
-
   while (Date.now() - startedAt < 15000) {
     try {
       const response = await fetch(url);
-      if (response.ok) {
-        return;
-      }
+      if (response.ok) return;
     } catch {
-      // proxy not ready yet
     }
-
     await delay(150);
   }
-
   throw new Error(`Timed out waiting for proxy health at ${url}`);
 }
 
 async function main() {
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'anthropic-proxy-nonstream-fallback-'));
-
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'anthropic-proxy-nonstream-sse-logging-'));
   let primaryRequests = 0;
   let fallbackRequests = 0;
 
   const primary = createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/messages') {
       primaryRequests += 1;
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({
-        id: 'msg_primary_empty',
-        type: 'message',
-        role: 'assistant',
-        model: 'primary-model',
-        content: [],
-        stop_reason: 'end_turn',
-        stop_sequence: null,
-        usage: { input_tokens: 5, output_tokens: 0 },
-      }));
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      res.end([
+        'event: message_start',
+        'data: {"type":"message_start","message":{"id":"msg_sse_empty","type":"message","role":"assistant","content":[],"model":"sse-primary-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}',
+        '',
+        'event: ping',
+        'data: {"type":"ping"}',
+        '',
+        'event: message_delta',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}',
+        '',
+        'event: message_stop',
+        'data: {"type":"message_stop"}',
+        '',
+      ].join('\n'));
       return;
     }
 
     if (req.method === 'GET' && req.url === '/v1/models') {
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ data: [{ id: 'primary-model', type: 'model' }], has_more: false }));
+      res.end(JSON.stringify({ data: [{ id: 'sse-primary-model', type: 'model' }], has_more: false }));
       return;
     }
 
@@ -70,11 +67,11 @@ async function main() {
       fallbackRequests += 1;
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
-        id: 'msg_fallback_ok',
+        id: 'msg_nonstream_fallback_ok',
         type: 'message',
         role: 'assistant',
         model: 'fallback-model',
-        content: [{ type: 'text', text: 'fallback response' }],
+        content: [{ type: 'text', text: 'fallback from nonstream sse' }],
         stop_reason: 'end_turn',
         stop_sequence: null,
         usage: { input_tokens: 5, output_tokens: 3 },
@@ -125,8 +122,8 @@ async function main() {
       ...process.env,
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
-      INSTANCE_NAME: 'anthropic-proxy-nonstream-fallback-check',
-      PRIMARY_PROVIDER_NAME: 'empty-primary',
+      INSTANCE_NAME: 'anthropic-proxy-nonstream-sse-logging-check',
+      PRIMARY_PROVIDER_NAME: 'sse-primary',
       PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
       PRIMARY_PROVIDER_API_KEY: 'primary-key',
       FALLBACK_CONFIG_PATH: fallbackConfigPath,
@@ -153,26 +150,22 @@ async function main() {
     });
 
     assert.equal(response.status, 200);
-    const body = await response.json() as { id?: string; content?: unknown[] };
-    assert.equal(body.id, 'msg_fallback_ok', 'Expected fallback response but got primary empty response');
-    assert.ok(Array.isArray(body.content) && body.content.length > 0, 'Expected non-empty content from fallback');
-    assert.equal(primaryRequests, 1, 'Expected primary to be called once');
-    assert.equal(fallbackRequests, 1, 'Expected fallback to be called once');
+    const body = await response.json() as { id?: string };
+    assert.equal(body.id, 'msg_nonstream_fallback_ok');
+    assert.equal(primaryRequests, 1);
+    assert.equal(fallbackRequests, 1);
 
     const stdoutText = stdout.join('');
-    assert.match(stdoutText, /upstream json response incomplete, falling back/, 'expected source empty-response fallback log');
-    assert.match(stdoutText, /attempting fallback upstream/, 'expected fallback attempt log');
+    assert.match(stdoutText, /probing non-standard stream response/, 'expected non-stream SSE probe log');
+    assert.match(stdoutText, /non-standard stream completed without usable output, falling back/, 'expected non-stream SSE fallback log');
     assert.match(stdoutText, /fallback upstream succeeded/, 'expected fallback success log');
-    assert.match(stdoutText, /"fallbackReason":"empty_response"/, 'expected fallback reason log');
 
-    console.log('Anthropic non-stream fallback check passed.');
+    console.log('Anthropic non-stream SSE logging check passed.');
   } finally {
     proxy.kill('SIGTERM');
     await Promise.race([
       once(proxy, 'exit'),
-      delay(3000).then(() => {
-        proxy.kill('SIGKILL');
-      }),
+      delay(3000).then(() => proxy.kill('SIGKILL')),
     ]);
     primary.close();
     fallback.close();

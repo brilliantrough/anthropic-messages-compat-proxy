@@ -8,6 +8,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { getAvailablePort } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -82,7 +83,7 @@ async function main() {
     throw new Error('Failed to resolve mock server addresses');
   }
 
-  const proxyPort = fallbackAddress.port + 1;
+  const proxyPort = await getAvailablePort();
   const fallbackConfigPath = path.join(tempDir, 'fallback.json');
   await writeFile(
     fallbackConfigPath,
@@ -120,7 +121,9 @@ async function main() {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
+  const stdout: string[] = [];
   const stderr: string[] = [];
+  proxy.stdout.on('data', chunk => stdout.push(String(chunk)));
   proxy.stderr.on('data', chunk => stderr.push(String(chunk)));
 
   try {
@@ -160,11 +163,8 @@ async function main() {
     const primaryHealth = endpointHealth.find(e => e.name === 'hanging-primary');
     assert.ok(primaryHealth, 'should have health record for hanging-primary');
 
-    // Primary should have been marked as failed (connect_error or timeout)
-    assert.ok(
-      primaryHealth.failureCount !== undefined && (primaryHealth.failureCount as number) >= 1,
-      `primary should have failureCount >= 1, got ${JSON.stringify(primaryHealth)}`,
-    );
+    assert.ok(primaryHealth.failureCount !== undefined && (primaryHealth.failureCount as number) >= 1);
+    assert.equal(primaryHealth.lastFailureReason, 'connect_timeout', 'connect timeout should be classified distinctly');
 
     // Verify admin stats has upstreamTimeouts counter
     const statsCounters = stats.stats as Record<string, unknown> | undefined;
@@ -172,6 +172,10 @@ async function main() {
       assert.ok(typeof statsCounters.upstreamTimeouts === 'number', 'stats.stats should have upstreamTimeouts');
       assert.ok((statsCounters.upstreamTimeouts as number) >= 1, 'upstreamTimeouts should be at least 1');
     }
+
+    const stdoutText = stdout.join('');
+    assert.match(stdoutText, /upstream connect timeout encountered, falling back/, 'expected connect-timeout-specific fallback log');
+    assert.match(stdoutText, /"nextFallbackName":"fallback-a"/, 'expected next fallback metadata in connect-timeout log');
 
     console.log(`Non-stream timeout fallback check passed (elapsed: ${elapsed}ms).`);
   } finally {

@@ -15,25 +15,19 @@ const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
 
 async function waitForHealthy(url: string) {
   const startedAt = Date.now();
-
   while (Date.now() - startedAt < 15000) {
     try {
       const response = await fetch(url);
-      if (response.ok) {
-        return;
-      }
+      if (response.ok) return;
     } catch {
-      // proxy not ready yet
     }
-
     await delay(150);
   }
-
   throw new Error(`Timed out waiting for proxy health at ${url}`);
 }
 
 async function main() {
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'anthropic-proxy-nonstream-fallback-'));
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'anthropic-proxy-stream-timeout-fallback-'));
 
   let primaryRequests = 0;
   let fallbackRequests = 0;
@@ -41,23 +35,17 @@ async function main() {
   const primary = createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/messages') {
       primaryRequests += 1;
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({
-        id: 'msg_primary_empty',
-        type: 'message',
-        role: 'assistant',
-        model: 'primary-model',
-        content: [],
-        stop_reason: 'end_turn',
-        stop_sequence: null,
-        usage: { input_tokens: 5, output_tokens: 0 },
-      }));
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      res.write('event: message_start\n');
+      res.write('data: {"type":"message_start","message":{"id":"msg_timeout","type":"message","role":"assistant","content":[],"model":"timeout-primary-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n\n');
+      await delay(1000);
+      res.end();
       return;
     }
 
     if (req.method === 'GET' && req.url === '/v1/models') {
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ data: [{ id: 'primary-model', type: 'model' }], has_more: false }));
+      res.end(JSON.stringify({ data: [{ id: 'timeout-primary-model', type: 'model' }], has_more: false }));
       return;
     }
 
@@ -68,17 +56,27 @@ async function main() {
   const fallback = createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/messages') {
       fallbackRequests += 1;
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({
-        id: 'msg_fallback_ok',
-        type: 'message',
-        role: 'assistant',
-        model: 'fallback-model',
-        content: [{ type: 'text', text: 'fallback response' }],
-        stop_reason: 'end_turn',
-        stop_sequence: null,
-        usage: { input_tokens: 5, output_tokens: 3 },
-      }));
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      res.end([
+        'event: message_start',
+        'data: {"type":"message_start","message":{"id":"msg_timeout_fallback","type":"message","role":"assistant","content":[],"model":"fallback-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":4}}}',
+        '',
+        'event: content_block_start',
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        '',
+        'event: content_block_delta',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"timeout fallback response"}}',
+        '',
+        'event: content_block_stop',
+        'data: {"type":"content_block_stop","index":0}',
+        '',
+        'event: message_delta',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":4}}',
+        '',
+        'event: message_stop',
+        'data: {"type":"message_stop"}',
+        '',
+      ].join('\n'));
       return;
     }
 
@@ -125,11 +123,12 @@ async function main() {
       ...process.env,
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
-      INSTANCE_NAME: 'anthropic-proxy-nonstream-fallback-check',
-      PRIMARY_PROVIDER_NAME: 'empty-primary',
+      INSTANCE_NAME: 'anthropic-proxy-stream-timeout-fallback-check',
+      PRIMARY_PROVIDER_NAME: 'timeout-primary',
       PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
       PRIMARY_PROVIDER_API_KEY: 'primary-key',
       FALLBACK_CONFIG_PATH: fallbackConfigPath,
+      PROXY_FIRST_TEXT_TIMEOUT_MS: '100',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -148,31 +147,37 @@ async function main() {
       body: JSON.stringify({
         model: 'test-model',
         max_tokens: 128,
+        stream: true,
         messages: [{ role: 'user', content: 'hello' }],
       }),
     });
 
     assert.equal(response.status, 200);
-    const body = await response.json() as { id?: string; content?: unknown[] };
-    assert.equal(body.id, 'msg_fallback_ok', 'Expected fallback response but got primary empty response');
-    assert.ok(Array.isArray(body.content) && body.content.length > 0, 'Expected non-empty content from fallback');
-    assert.equal(primaryRequests, 1, 'Expected primary to be called once');
-    assert.equal(fallbackRequests, 1, 'Expected fallback to be called once');
+    const text = await response.text();
+    assert.match(text, /timeout fallback response/);
+    assert.equal(primaryRequests, 1);
+    assert.equal(fallbackRequests, 1);
+
+    const statsResponse = await fetch(`http://127.0.0.1:${proxyPort}/admin/stats`);
+    assert.equal(statsResponse.status, 200);
+    const stats = await statsResponse.json() as {
+      endpointHealth?: Array<{ name?: string; lastFailureReason?: string | null }>;
+      stats?: { upstreamTimeouts?: number };
+    };
+    const primaryHealth = stats.endpointHealth?.find(item => item.name === 'timeout-primary');
+    assert.equal(primaryHealth?.lastFailureReason, 'headers_only_timeout');
+    assert.ok((stats.stats?.upstreamTimeouts ?? 0) >= 1, 'expected upstream timeout counter to increment');
 
     const stdoutText = stdout.join('');
-    assert.match(stdoutText, /upstream json response incomplete, falling back/, 'expected source empty-response fallback log');
-    assert.match(stdoutText, /attempting fallback upstream/, 'expected fallback attempt log');
-    assert.match(stdoutText, /fallback upstream succeeded/, 'expected fallback success log');
-    assert.match(stdoutText, /"fallbackReason":"empty_response"/, 'expected fallback reason log');
+    assert.match(stdoutText, /stream timeout before usable output, falling back/, 'expected timeout fallback log');
+    assert.match(stdoutText, /"fallbackReason":"headers_only_timeout"/, 'expected headers_only_timeout classification');
 
-    console.log('Anthropic non-stream fallback check passed.');
+    console.log('Anthropic stream timeout fallback check passed.');
   } finally {
     proxy.kill('SIGTERM');
     await Promise.race([
       once(proxy, 'exit'),
-      delay(3000).then(() => {
-        proxy.kill('SIGKILL');
-      }),
+      delay(3000).then(() => proxy.kill('SIGKILL')),
     ]);
     primary.close();
     fallback.close();

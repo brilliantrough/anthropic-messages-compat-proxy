@@ -8,6 +8,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { getAvailablePort } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -110,7 +111,7 @@ async function main() {
     throw new Error('Failed to resolve mock server addresses');
   }
 
-  const proxyPort = fallbackAddress.port + 1;
+  const proxyPort = await getAvailablePort();
   const fallbackConfigPath = path.join(tempDir, 'fallback.json');
   await writeFile(
     fallbackConfigPath,
@@ -167,6 +168,11 @@ async function main() {
     assert.match(text, /fallback response/);
     assert.equal(primaryRequests, 1, 'Expected primary to be called once');
     assert.equal(fallbackRequests, 1, 'Expected fallback to be called once');
+    await delay(50);
+
+    const stdoutText = stdout.join('');
+    assert.match(stdoutText, /stream completed without usable output, falling back/, 'expected stream fallback log');
+    assert.match(stdoutText, /fallback upstream succeeded/, 'expected fallback success log');
 
     console.log('Anthropic stream fallback check passed.');
   } finally {

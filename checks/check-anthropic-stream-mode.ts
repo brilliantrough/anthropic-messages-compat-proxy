@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { getAvailablePort } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -67,7 +68,7 @@ async function main() {
     throw new Error('Failed to resolve mock server address');
   }
 
-  const proxyPort = primaryAddress.port + 1;
+  const proxyPort = await getAvailablePort();
 
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
