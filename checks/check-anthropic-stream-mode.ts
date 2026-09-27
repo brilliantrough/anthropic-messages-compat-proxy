@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { getAvailablePort } from './_helpers.js';
+import { getAvailablePort, instanceEnvPath, writeRoutingConfig } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -24,6 +26,7 @@ async function waitForHealthy(url: string) {
 }
 
 async function main() {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'anthropic-proxy-stream-mode-'));
   const primary = createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/messages') {
       res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
@@ -70,6 +73,12 @@ async function main() {
 
   const proxyPort = await getAvailablePort();
 
+  const routingConfigPath = await writeRoutingConfig(tempDir, {
+    primary: { name: 'primary', baseUrl: `http://127.0.0.1:${primaryAddress.port}`, apiKey: 'test-key' },
+    models: ['claude-sonnet-4-5'],
+    aliases: { 'client-alias-model': 'claude-sonnet-4-5' },
+  });
+
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
     cwd: workspaceRoot,
@@ -78,9 +87,8 @@ async function main() {
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
       INSTANCE_NAME: 'anthropic-proxy-stream-mode-check',
-      PRIMARY_PROVIDER_NAME: 'primary',
-      PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
-      PRIMARY_PROVIDER_API_KEY: 'test-key',
+      PROXY_ENV_PATH: instanceEnvPath(tempDir),
+      FALLBACK_CONFIG_PATH: routingConfigPath,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -157,6 +165,7 @@ async function main() {
     ]);
     primary.close();
     await once(primary, 'close');
+    await rm(tempDir, { recursive: true, force: true });
   }
 
   if (stderr.length > 0) {

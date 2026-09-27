@@ -2,130 +2,233 @@
 
 [English](../examples.md) | [中文](./examples.md)
 
-下面所有示例都使用占位值和公开安全的模型名，不包含真实 provider 或密钥。
+这些示例使用公开占位值。请把 host、model 和 key 换成你的本地实例设置。
 
-## 非流式请求
+每个请求体都是 Anthropic Messages 形状。代理会保留原生 Anthropic 字段，除非必须映射模型、移除 `proxy_stream_mode`，或清理顶层 `system` billing 文本。
+
+## 客户端使用的 Headers
 
 ```bash
-curl -s http://127.0.0.1:11234/v1/responses \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"public-alias-model","input":"Reply with exactly OK.","stream":false}'
+-H 'Content-Type: application/json' \
+-H 'x-api-key: local-client-key' \
+-H 'anthropic-version: 2023-06-01'
 ```
 
-## 流式请求
+客户端 `x-api-key` 会被接受以兼容客户端，但不会转发到上游。
+
+上游 `x-api-key` 会替换为实际服务该请求的渠道的 API key。
+
+如果客户端发送 `anthropic-version`，代理会转发它。否则代理会发送配置中的 `ANTHROPIC_VERSION`。
+
+## 非流式消息
 
 ```bash
-curl -N http://127.0.0.1:11234/v1/responses \
+curl -s http://127.0.0.1:11234/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"public-claude","max_tokens":128,"messages":[{"role":"user","content":"Reply with exactly OK."}]}'
+```
+
+上游收到的仍是 Anthropic body。不同之处是 `model` 可能被映射成 provider 模型 ID。
+
+## 流式消息
+
+```bash
+curl -N http://127.0.0.1:11234/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
-  -d '{"model":"public-alias-model","input":"Count to three.","stream":true}'
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"public-claude","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"Count to three."}]}'
 ```
 
-## 模型别名映射示例
+客户端会收到 Anthropic SSE 事件。`normalized` 模式下，代理可以在 `message_start` 中恢复客户端请求的模型别名。
 
-`model-map.json`:
+## 可选 anthropic-beta Header
+
+```bash
+curl -s http://127.0.0.1:11234/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'anthropic-beta: interleaved-thinking-2025-05-14' \
+  -d '{"model":"public-claude","max_tokens":256,"messages":[{"role":"user","content":"Think briefly, then answer."}]}'
+```
+
+如果客户端省略 `anthropic-beta`，代理只会在 `ANTHROPIC_BETA` 已配置且非空时发送它。
+
+## 模型别名
+
+`fallback.json` 中的别名：
 
 ```json
 {
-  "model_mappings": {
-    "public-alias-model": "my-model-v2"
+  "aliases": {
+    "public-claude": "claude-sonnet-4-5"
   }
 }
 ```
 
-请求体：
+请求：
 
-```json
-{
-  "model": "public-alias-model",
-  "input": "Summarize this text.",
-  "stream": false
-}
+```bash
+curl -s http://127.0.0.1:11234/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"public-claude","max_tokens":128,"messages":[{"role":"user","content":"Summarize this in one sentence."}]}'
 ```
 
-客户端仍然请求 `public-alias-model`，但代理会把它改写成真正上游模型 `my-model-v2` 再发出去。
+代理向上游发送 `claude-sonnet-4-5`。成功 JSON 响应和 normalized stream `message_start` 事件会在客户端可见模型中使用 `public-claude`。
 
-## fallback provider 示例
+## 原生 cache_control
 
-`fallback.json`:
+Anthropic prompt caching 位于 content block 内，不是代理级 cache key。
+
+```bash
+curl -s http://127.0.0.1:11234/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"public-claude","max_tokens":256,"system":[{"type":"text","text":"Use the project glossary when answering.","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"Explain the proxy fallback boundary."}]}]}'
+```
+
+代理会在 Anthropic Messages 请求体携带 `cache_control` 的任何位置保留它，包括 `system`、`messages`、tool input 和其他 content part。
+
+## Tool Use
+
+```bash
+curl -s http://127.0.0.1:11234/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"public-claude","max_tokens":512,"tools":[{"name":"get_weather","description":"Get weather for a city.","input_schema":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}],"messages":[{"role":"user","content":"What is the weather in San Francisco?"}]}'
+```
+
+工具调用是原生 Anthropic `tool_use` content block。代理会把 `tool_use` block 视为 stream fallback 判定中的可用输出。
+
+## 流式 Tool Deltas
+
+流式工具调用通常以 `content_block_start` 开始，然后用 `input_json_delta` 追加 JSON：
+
+```text
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"location\":"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" \"SF\"}"}}
+```
+
+当代理为非流式客户端从上游 stream 合成 JSON 时，会拼接 partial JSON。解析成功后，它会放入最终 `tool_use.input` 对象。
+
+## 顶层 system Billing Header 清理
+
+有些网关会把 attribution 文本加到顶层 Anthropic `system` 文本前面：
 
 ```json
 {
-  "fallback_api_config": [
+  "model": "public-claude",
+  "max_tokens": 128,
+  "system": "x-anthropic-billing-header: cc_version=2.1.119; cch=dynamic-value;\n\nStable system prompt",
+  "messages": [
     {
-      "name": "fallback-a",
-      "base_url": "https://fallback-a.example",
-      "api_key_env": "FALLBACK_A_API_KEY"
-    },
-    {
-      "name": "fallback-b",
-      "base_url": "https://fallback-b.example",
-      "api_key_env": "FALLBACK_B_API_KEY"
+      "role": "user",
+      "content": "Reply with exactly OK."
     }
   ]
 }
 ```
 
-`.env`:
-
-```env
-FALLBACK_A_API_KEY=your_fallback_a_api_key_here
-FALLBACK_B_API_KEY=your_fallback_b_api_key_here
-```
-
-建议优先使用 `api_key_env`，这样真实密钥仍保存在本地 env 文件里，而不是跟踪到 JSON 中。
-
-仓库里的 `instances/example-*` 模板默认把 `fallback_api_config` 设为空，避免第一次部署时误打到占位 fallback 域名。
-
-## Prompt Cache Hints
-
-请求体：
+默认 `PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line` 时，代理会转发：
 
 ```json
 {
-  "model": "public-alias-model",
-  "input": "Summarize the following text.",
-  "prompt_cache_retention": "in_memory",
-  "prompt_cache_key": "stable-summary-prefix"
+  "system": "Stable system prompt"
 }
 ```
 
-`.env` 中的默认注入值：
+使用 `strip_cch` 时，代理会保留该行，但删除动态 `cch=` 字段。
 
-```env
-PROXY_PROMPT_CACHE_RETENTION=in_memory
-PROXY_PROMPT_CACHE_KEY=stable-summary-prefix
+只有顶层 `system` 文本会被清理。用户消息会保持原样。
+
+## 渠道路由与 Fallback
+
+`fallback.json`:
+
+```json
+{
+  "default_model": "claude-sonnet-4-5",
+  "channels": [
+    {
+      "id": "primary",
+      "name": "Primary",
+      "base_url": "https://api.anthropic.com",
+      "api_key": "anthropic-placeholder"
+    },
+    {
+      "id": "fallback-a",
+      "name": "Fallback A",
+      "base_url": "https://fallback-a.example",
+      "api_key": "fallback-a-placeholder"
+    },
+    {
+      "id": "fallback-b",
+      "name": "Fallback B",
+      "base_url": "https://fallback-b.example",
+      "api_key": "fallback-b-placeholder",
+      "disable_cooldown": true
+    }
+  ],
+  "models": {
+    "claude-sonnet-4-5": { "channel_ids": ["primary", "fallback-a", "fallback-b"] }
+  }
+}
 ```
 
-`prompt_cache_key` 必须稳定，不要包含时间戳、UUID、request id 或任何每次请求都不同的值。
+凭据 inline 存在路由文档里，因此文件权限必须保持 `0600`。`disable_cooldown: true` 只豁免该渠道的普通自动熔断，额度耗尽与人工阻断依然生效。
 
-## Claude Billing Header 兼容示例
+渠道按列表顺序尝试，每个渠道最多 `PROXY_CHANNEL_MAX_ATTEMPTS` 次，并受总时间预算限制。
 
-如果流量会先经过 Claude Code 相关网关，建议保持下面这个默认配置，让 prompt 前缀更稳定：
+## 可用输出后不切换 fallback
 
-```env
-PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line
+流式 fallback 只允许在可用输出到达客户端之前发生。
+
+可用输出包括非空 `text_delta`、非空 `thinking_delta`、非空 `signature_delta`、任何字符串 `input_json_delta.partial_json`，以及 `tool_use` block start。
+
+到达这个边界后，代理不再切换渠道。后续 stream 失败会留在当前响应路径上，通常表现为上游事件或终止性的 Anthropic `error` 事件。
+
+## Stream Mode Override
+
+除非客户端需要原始上游字节，否则使用默认 normalized 模式。
+
+Header override:
+
+```bash
+curl -N http://127.0.0.1:11234/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-proxy-stream-mode: raw' \
+  -d '{"model":"public-claude","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"Stream one short sentence."}]}'
 ```
 
-`strip_line` 会删除整行 `x-anthropic-billing-header: ...`。只有在你确实需要保留 attribution 文本时，才建议改成 `strip_cch`，只删除动态 `cch=...` 字段。
+Body override:
 
-## 什么时候用 `normalized`，什么时候用 `raw`
-
-如果你希望代理先解析并规范化上游 SSE 事件，再转发给客户端，使用 `normalized`：
-
-```env
-PROXY_STREAM_MODE=normalized
+```json
+{
+  "model": "public-claude",
+  "max_tokens": 128,
+  "stream": true,
+  "proxy_stream_mode": "raw",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Stream one short sentence."
+    }
+  ]
+}
 ```
 
-如果你希望客户端直接处理上游事件形状，减少代理端解释，使用 `raw`：
-
-```env
-PROXY_STREAM_MODE=raw
-```
-
-你也可以按请求覆盖流模式：
-
-- 请求体中的 `proxy_stream_mode`
-- 请求头中的 `X-Proxy-Stream-Mode`
-
-都会覆盖环境变量默认值。
+`proxy_stream_mode` 是代理本地字段，会在请求发送到上游前移除。

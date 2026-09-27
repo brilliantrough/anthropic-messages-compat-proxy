@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { createHealthRegistry } from '../src/channel-health.js';
 import { createRuntimeConfigStore } from '../src/runtime-config.js';
 
 const allTempDirs: string[] = [];
@@ -13,157 +14,144 @@ function makeTempDir() {
   return dir;
 }
 
-function writeDotEnv(envPath: string, lines: string[]) {
-  writeFileSync(envPath, lines.join('\n'), 'utf8');
+function routingDocument(overrides: Record<string, unknown> = {}) {
+  return {
+    default_model: 'claude-opus-4-8',
+    channels: [
+      { id: 'primary', name: 'Primary', base_url: 'https://api.anthropic.test', api_key: 'test-key-123' },
+      { id: 'fallback-a', name: 'Fallback A', base_url: 'https://fallback.test', api_key: 'fb-key' },
+    ],
+    models: { 'claude-opus-4-8': { channel_ids: ['primary', 'fallback-a'] } },
+    aliases: { 'claude-latest': 'claude-opus-4-8' },
+    ...overrides,
+  };
 }
 
-function setupDir(dir: string) {
-  const fallbackPath = path.join(dir, 'fallback.json');
-  const modelMapPath = path.join(dir, 'model-map.json');
-  writeFileSync(fallbackPath, JSON.stringify({ fallback_api_config: [] }, null, 2), 'utf8');
-  writeFileSync(modelMapPath, JSON.stringify({ model_mappings: {} }, null, 2), 'utf8');
+function writeEnv(envPath: string, lines: string[]) {
+  writeFileSync(envPath, lines.join('\n'), 'utf8');
 }
 
 function main() {
   try {
-    console.log('=== 1. Initial snapshot has Anthropic defaults ===');
-    const dir1 = makeTempDir();
-    setupDir(dir1);
-    const envPath = path.join(dir1, '.env');
-    writeDotEnv(envPath, [
-      'PRIMARY_PROVIDER_NAME=anthropic-test',
-      'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.test',
-      'PRIMARY_PROVIDER_API_KEY=test-key-123',
-      'PORT=8080',
+    console.log('=== 1. Initial snapshot uses the routing config ===');
+    const dir = makeTempDir();
+    const envPath = path.join(dir, '.env');
+    const routingPath = path.join(dir, 'fallback.json');
+    writeFileSync(routingPath, JSON.stringify(routingDocument(), null, 2), 'utf8');
+    writeEnv(envPath, [
       'HOST=127.0.0.1',
-      `FALLBACK_CONFIG_PATH=${path.join(dir1, 'fallback.json')}`,
-      `MODEL_MAP_PATH=${path.join(dir1, 'model-map.json')}`,
+      'PORT=12241',
+      'INSTANCE_NAME=runtime-reload-check',
+      `FALLBACK_CONFIG_PATH=${routingPath}`,
     ]);
 
     const store = createRuntimeConfigStore({ envPath, mode: 'anthropic' });
+    const healthRegistry = createHealthRegistry({});
+    store.registerHealthRegistry(healthRegistry);
+
     const snap1 = store.getSnapshot();
+    assert.equal(snap1.config.anthropicVersion, '2023-06-01');
+    assert.equal(snap1.config.anthropicBeta, undefined);
+    assert.equal(snap1.config.claudeBillingHeaderMode, 'strip_line');
+    assert.equal(snap1.config.routingConfig.channelsById.size, 2);
+    assert.equal(snap1.config.routingConfig.channelsById.get('primary')?.messagesUrl, 'https://api.anthropic.test/v1/messages');
+    assert.equal(snap1.config.routingConfig.aliases['claude-latest'], 'claude-opus-4-8');
+    assert.equal(snap1.config.routingConfigPath, routingPath);
+    assert.equal(healthRegistry.snapshot().channels.length, 2, 'every configured channel gets a health record at startup');
+    assert.equal(healthRegistry.snapshot().channels.length, 2, 'aliases do not create extra health records');
 
-    assert.equal(snap1.config.anthropicVersion, '2023-06-01', 'default anthropicVersion should be 2023-06-01');
-    assert.equal(snap1.config.anthropicBeta, undefined, 'default anthropicBeta should be undefined');
-    assert.equal(
-      snap1.config.upstreamMessagesUrl,
-      'https://api.anthropic.test/v1/messages',
-      'upstreamMessagesUrl should be built from base URL',
-    );
-    assert.equal(
-      snap1.config.upstreamModelsUrl,
-      'https://api.anthropic.test/v1/models',
-      'upstreamModelsUrl should be built from base URL',
-    );
-    assert.equal(snap1.config.claudeBillingHeaderMode, 'strip_line', 'default billing header mode');
-
-    console.log('=== 2. Reload picks up new ANTHROPIC_VERSION ===');
-    writeDotEnv(envPath, [
-      'PRIMARY_PROVIDER_NAME=anthropic-test',
-      'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.test',
-      'PRIMARY_PROVIDER_API_KEY=test-key-123',
-      'PORT=8080',
+    console.log('=== 2. Reload applies env and routing changes ===');
+    writeEnv(envPath, [
       'HOST=127.0.0.1',
-      'ANTHROPIC_VERSION=2024-01-01',
-      `FALLBACK_CONFIG_PATH=${path.join(dir1, 'fallback.json')}`,
-      `MODEL_MAP_PATH=${path.join(dir1, 'model-map.json')}`,
-    ]);
-
-    const result2 = store.reloadFromFiles();
-    assert.equal(result2.ok, true, 'reload should succeed');
-    const snap2 = store.getSnapshot();
-    assert.equal(snap2.runtimeVersion, 2, 'version incremented');
-    assert.equal(snap2.config.anthropicVersion, '2024-01-01', 'anthropicVersion should be updated after reload');
-    assert.equal(snap2.config.anthropicBeta, undefined, 'anthropicBeta should still be undefined');
-
-    console.log('=== 3. Reload picks up new ANTHROPIC_BETA ===');
-    writeDotEnv(envPath, [
-      'PRIMARY_PROVIDER_NAME=anthropic-test',
-      'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.test',
-      'PRIMARY_PROVIDER_API_KEY=test-key-123',
-      'PORT=8080',
-      'HOST=127.0.0.1',
-      'ANTHROPIC_VERSION=2024-01-01',
-      'ANTHROPIC_BETA=new-beta-feature',
-      `FALLBACK_CONFIG_PATH=${path.join(dir1, 'fallback.json')}`,
-      `MODEL_MAP_PATH=${path.join(dir1, 'model-map.json')}`,
-    ]);
-
-    const result3 = store.reloadFromFiles();
-    assert.equal(result3.ok, true);
-    const snap3 = store.getSnapshot();
-    assert.equal(snap3.config.anthropicBeta, 'new-beta-feature', 'anthropicBeta should be updated');
-
-    console.log('=== 4. Reload picks up PROXY_CLAUDE_BILLING_HEADER_MODE change ===');
-    writeDotEnv(envPath, [
-      'PRIMARY_PROVIDER_NAME=anthropic-test',
-      'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.test',
-      'PRIMARY_PROVIDER_API_KEY=test-key-123',
-      'PORT=8080',
-      'HOST=127.0.0.1',
+      'PORT=12241',
+      'INSTANCE_NAME=runtime-reload-check',
       'ANTHROPIC_VERSION=2024-01-01',
       'ANTHROPIC_BETA=new-beta-feature',
       'PROXY_CLAUDE_BILLING_HEADER_MODE=strip_cch',
-      `FALLBACK_CONFIG_PATH=${path.join(dir1, 'fallback.json')}`,
-      `MODEL_MAP_PATH=${path.join(dir1, 'model-map.json')}`,
+      'PROXY_HEALTH_FAILURE_THRESHOLD=7',
+      'PROXY_CHANNEL_MAX_ATTEMPTS=2',
+      `FALLBACK_CONFIG_PATH=${routingPath}`,
     ]);
+    writeFileSync(routingPath, JSON.stringify(routingDocument({
+      channels: [
+        { id: 'primary', name: 'Primary renamed', base_url: 'https://api.anthropic.test', api_key: 'test-key-123' },
+        { id: 'fallback-a', name: 'Fallback A', base_url: 'https://fallback.test', api_key: 'rotated-key' },
+        { id: 'fallback-b', name: 'Fallback B', base_url: 'https://fallback-b.test', api_key: 'fb-b-key' },
+      ],
+      models: {
+        'claude-opus-4-8': { channel_ids: ['primary', 'fallback-b'] },
+        'claude-sonnet-4-6': { channel_ids: ['fallback-a'] },
+      },
+    }), null, 2), 'utf8');
 
+    const generationBeforeReload = healthRegistry.snapshot().topologyGeneration;
+    const result2 = store.reloadFromFiles();
+    assert.equal(result2.ok, true);
+    const snap2 = store.getSnapshot();
+    assert.equal(snap2.runtimeVersion, 2, 'runtimeVersion increments on reload');
+    assert.equal(snap2.config.anthropicVersion, '2024-01-01');
+    assert.equal(snap2.config.anthropicBeta, 'new-beta-feature');
+    assert.equal(snap2.config.claudeBillingHeaderMode, 'strip_cch');
+    assert.equal(snap2.config.healthFailureThreshold, 7, 'policy changes apply without a restart');
+    assert.equal(snap2.config.channelMaxAttempts, 2);
+    assert.equal(snap2.config.routingConfig.channelsById.size, 3);
+    assert.equal(snap2.config.routingConfig.channelsById.get('primary')?.name, 'Primary renamed');
+    assert.equal(snap2.config.routingConfig.modelRoutes.get('claude-opus-4-8')?.channelIds.join(','), 'primary,fallback-b');
+    assert.equal(snap2.config.routingConfig.modelRoutes.get('claude-sonnet-4-6')?.channelIds.join(','), 'fallback-a');
+
+    const healthAfterReload = healthRegistry.snapshot();
+    assert.ok(healthAfterReload.topologyGeneration > generationBeforeReload, 'reload bumps the topology generation');
+    assert.equal(healthAfterReload.channels.length, 3, 'the new channel gets a health record');
+    const renamedPrimary = healthAfterReload.channels.find(record => record.channelId === 'primary')!;
+    assert.equal(renamedPrimary.fingerprint, snap1.config.routingConfig.channelsById.get('primary')!.fingerprint, 'a rename keeps the same fingerprint');
+    const rotatedFallback = healthAfterReload.channels.find(record => record.channelId === 'fallback-a')!;
+    assert.notEqual(rotatedFallback.fingerprint, snap1.config.routingConfig.channelsById.get('fallback-a')!.fingerprint, 'a key rotation changes the fingerprint');
+
+    console.log('=== 3. An invalid routing document keeps the running snapshot ===');
+    writeFileSync(routingPath, JSON.stringify({ default_model: 'x', channels: [], models: {}, aliases: {} }, null, 2), 'utf8');
+    const failed = store.reloadFromFiles();
+    assert.equal(failed.ok, false);
+    assert.match(failed.ok === false ? failed.error : '', /channels/u);
+    const snap3 = store.getSnapshot();
+    assert.equal(snap3.runtimeVersion, 2, 'a rejected document must not bump the runtime version');
+    assert.equal(snap3.config.routingConfig.channelsById.get('primary')?.name, 'Primary renamed');
+    assert.equal(healthRegistry.snapshot().channels.length, 3, 'a rejected document must not touch the health topology');
+    assert.equal(readFileSync(routingPath, 'utf8').includes('"channels": []'), true, 'reload never rewrites the routing file');
+
+    writeFileSync(routingPath, JSON.stringify(routingDocument(), null, 2), 'utf8');
+
+    console.log('=== 4. PORT/HOST changes report restartRequiredFields ===');
+    writeEnv(envPath, [
+      'HOST=0.0.0.0',
+      'PORT=9999',
+      'INSTANCE_NAME=runtime-reload-check',
+      `FALLBACK_CONFIG_PATH=${routingPath}`,
+    ]);
     const result4 = store.reloadFromFiles();
     assert.equal(result4.ok, true);
     const snap4 = store.getSnapshot();
-    assert.equal(snap4.config.claudeBillingHeaderMode, 'strip_cch', 'billing header mode updated');
+    assert.ok(snap4.restartRequiredFields.includes('PORT'));
+    assert.ok(snap4.restartRequiredFields.includes('HOST'));
+    assert.equal(snap4.config.port, 9999);
 
-    console.log('=== 5. PORT/HOST changes still report restartRequiredFields ===');
-    writeDotEnv(envPath, [
-      'PRIMARY_PROVIDER_NAME=anthropic-test',
-      'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.test',
-      'PRIMARY_PROVIDER_API_KEY=test-key-123',
-      'PORT=9999',
+    console.log('=== 5. Routing-only edits do not require a restart ===');
+    writeEnv(envPath, [
       'HOST=0.0.0.0',
-      'ANTHROPIC_VERSION=2024-01-01',
-      'ANTHROPIC_BETA=new-beta-feature',
-      'PROXY_CLAUDE_BILLING_HEADER_MODE=strip_cch',
-      `FALLBACK_CONFIG_PATH=${path.join(dir1, 'fallback.json')}`,
-      `MODEL_MAP_PATH=${path.join(dir1, 'model-map.json')}`,
+      'PORT=9999',
+      'INSTANCE_NAME=runtime-reload-check',
+      'ANTHROPIC_VERSION=2025-01-01',
+      `FALLBACK_CONFIG_PATH=${routingPath}`,
     ]);
-
     const result5 = store.reloadFromFiles();
     assert.equal(result5.ok, true);
     const snap5 = store.getSnapshot();
-    assert.ok(snap5.restartRequiredFields.includes('PORT'), 'PORT should be in restartRequiredFields');
-    assert.ok(snap5.restartRequiredFields.includes('HOST'), 'HOST should be in restartRequiredFields');
-    assert.equal(snap5.config.port, 9999, 'port should be updated in snapshot');
-    assert.equal(snap5.config.host, '0.0.0.0', 'host should be updated in snapshot');
+    assert.deepEqual(snap5.restartRequiredFields, [], 'routing/model/alias edits apply live');
+    assert.equal(snap5.config.anthropicVersion, '2025-01-01');
 
-    console.log('=== 6. Anthropic field changes do NOT trigger restartRequiredFields ===');
-    writeDotEnv(envPath, [
-      'PRIMARY_PROVIDER_NAME=anthropic-test',
-      'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.test',
-      'PRIMARY_PROVIDER_API_KEY=test-key-123',
-      'PORT=9999',
-      'HOST=0.0.0.0',
-      'ANTHROPIC_VERSION=2025-01-01',
-      'ANTHROPIC_BETA=another-beta',
-      'PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line',
-      `FALLBACK_CONFIG_PATH=${path.join(dir1, 'fallback.json')}`,
-      `MODEL_MAP_PATH=${path.join(dir1, 'model-map.json')}`,
-    ]);
-
-    const result6 = store.reloadFromFiles();
-    assert.equal(result6.ok, true);
-    const snap6 = store.getSnapshot();
-    assert.equal(snap6.config.anthropicVersion, '2025-01-01', 'anthropicVersion updated');
-    assert.equal(snap6.config.anthropicBeta, 'another-beta', 'anthropicBeta updated');
-    assert.equal(snap6.config.claudeBillingHeaderMode, 'strip_line', 'billing mode updated');
-    assert.deepEqual(
-      snap6.restartRequiredFields, [],
-      'Anthropic field changes should NOT trigger restartRequiredFields',
-    );
-
-    console.log('\nAll anthropic-runtime-reload checks passed.');
+    console.log('All anthropic-runtime-reload checks passed.');
   } finally {
-    for (const d of allTempDirs) {
-      rmSync(d, { recursive: true, force: true });
+    for (const dir of allTempDirs) {
+      rmSync(dir, { recursive: true, force: true });
     }
   }
 }

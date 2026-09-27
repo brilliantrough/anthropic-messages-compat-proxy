@@ -1,3 +1,23 @@
 {
-  "fallback_api_config": []
+  "default_model": "claude-sonnet-4-5",
+  "channels": [
+    {
+      "id": "primary",
+      "name": "Primary",
+      "base_url": "https://api.anthropic.com",
+      "api_key": "your_api_key_here"
+    },
+    {
+      "id": "fallback-a",
+      "name": "Fallback A",
+      "base_url": "https://fallback-a.example",
+      "api_key": "your_fallback_a_api_key_here"
+    }
+  ],
+  "models": {
+    "claude-sonnet-4-5": { "channel_ids": ["primary", "fallback-a"] }
+  },
+  "aliases": {
+    "public-claude": "claude-sonnet-4-5"
+  }
 }

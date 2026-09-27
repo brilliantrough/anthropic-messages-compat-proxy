@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { once } from 'node:events';
 
 import { createAnthropicProxyServer } from '../src/anthropic-proxy.js';
-import { createEndpointHealthStore } from '../src/proxy-core.js';
+import { createHealthRegistry } from '../src/channel-health.js';
 import { createProxyStats } from '../src/anthropic-messages-handler.js';
+import { healthRecord, routingFixture, throwingOnceRegistry } from './_helpers.js';
 
 async function main() {
   const upstream = createServer(async (req, res) => {
@@ -37,41 +41,25 @@ async function main() {
   const upstreamAddress = upstream.address();
   assert.ok(upstreamAddress && typeof upstreamAddress !== 'string');
 
-  const primaryEndpoint = {
-    name: 'primary',
-    url: `http://127.0.0.1:${upstreamAddress.port}/v1/messages`,
-    apiKey: 'test-key',
-    isFallback: false,
-  };
-
-  const realStore = createEndpointHealthStore({
-    endpointTimeoutCooldownMs: 120000,
-    endpointInvalidResponseCooldownMs: 120000,
-    endpointAuthCooldownMs: 1800000,
-    endpointFailureThreshold: 1,
-    endpointHalfOpenMaxProbes: 1,
+  const routingConfig = routingFixture({
+    primary: { name: 'primary', baseUrl: `http://127.0.0.1:${upstreamAddress.port}`, apiKey: 'test-key' },
+    models: ['claude-sonnet-4-5'],
   });
-
-  const wrappedStore = {
-    ...realStore,
-    markEndpointSuccess(endpoint: typeof primaryEndpoint) {
-      if (endpoint.name === 'primary') {
-        throw new Error('boom-success-hook');
-      }
-      realStore.markEndpointSuccess(endpoint);
-    },
-  };
+  const realStore = createHealthRegistry({
+    healthFailureThreshold: 1,
+    healthCooldownMs: 120000,
+    healthWindowMs: 180000,
+  });
+  const wrappedStore = throwingOnceRegistry(realStore);
 
   const stats = createProxyStats();
   const proxy = createAnthropicProxyServer({
     port: 0,
     host: '127.0.0.1',
     instanceName: 'anthropic-unhandled-parity-check',
-    primaryProviderName: 'primary',
-    primaryProviderBaseUrl: `http://127.0.0.1:${upstreamAddress.port}`,
-    apiKey: 'test-key',
     anthropicVersion: '2023-06-01',
-    endpointHealthStore: wrappedStore,
+    routingConfig,
+    healthRegistry: wrappedStore,
     stats,
   });
 
@@ -89,8 +77,11 @@ async function main() {
     });
 
     assert.equal(response.status, 500);
-    const health = realStore.getSnapshot(primaryEndpoint);
-    assert.equal(health.lastFailureReason, 'proxy_unhandled_error');
+    const health = healthRecord(realStore, 'primary');
+    // proxy_unhandled_error keeps scope 'none': it is recorded for diagnosis but never counted as a channel failure.
+    assert.equal(health.lastFailureReason, 'proxy_internal');
+    assert.equal(health.windowFailures, 0, 'a proxy-side bug must not blame the channel window');
+    assert.equal(health.remainingMs, 0, 'a proxy-side bug must not open the breaker');
     assert.equal(stats.fallbackReasons.proxyUnhandledError, 1);
 
     console.log('Anthropic unhandled-error parity check passed.');

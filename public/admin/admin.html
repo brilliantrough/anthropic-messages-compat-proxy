@@ -1,81 +1,88 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Admin Config</title>
+<meta name="theme-color" content="#ffffff">
+<title>管理配置 · Anthropic Relay</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ffffff'/%3E%3Cpath d='M8 12v13m8-19v19m8-16v11' stroke='%233b63dc' stroke-width='4'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/admin/assets/admin.css">
 </head>
 <body>
-<div class="admin-shell">
-  <header class="topbar">
-    <div class="topbar-main">
-      <div class="topbar-identity">
-        <h1>Admin Config</h1>
-        <div id="instance-summary" class="meta-row">Loading instance...</div>
-      </div>
-      <div class="topbar-status">
-        <span id="dirty-badge" class="badge badge-ok" style="display:none">Unsaved changes</span>
-        <span id="topbar-runtime-version" class="badge">Runtime -</span>
-        <span id="topbar-active-requests" class="badge">Active -</span>
-      </div>
-      <div class="topbar-actions btn-row">
-        <button id="btn-validate" class="primary">Validate</button>
-        <button id="btn-reload" class="warning">Reload</button>
-        <button id="btn-rollback" class="danger">Rollback</button>
-        <button id="btn-save" class="primary">Save</button>
-      </div>
-    </div>
-    <div id="status" class="notice notice-info">Loading...</div>
-    <div id="restart-notice" style="display:none"></div>
-    <div id="validation-result"></div>
-    <div id="action-result"></div>
-  </header>
+<a class="skip-link" href="#main-content">跳转到主内容</a>
+<div class="admin-shell app-shell">
+  <aside class="app-sidebar">
+    <a class="brand" href="/admin" aria-label="Anthropic 管理首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>relay<span class="brand-caption">ANTHROPIC MESSAGES GATEWAY</span></span></a>
+    <div class="workspace-label"><span class="workspace-avatar">R</span><div>代理工作区<small>Anthropic Messages API</small></div></div>
+    <nav class="app-nav" aria-label="主导航">
+      <div class="nav-label">工作区</div>
+      <a class="nav-link" href="/admin/monitor"><span class="nav-icon" aria-hidden="true">◷</span>概览<span class="nav-live">实时</span></a>
+      <a id="usage-nav" class="nav-link" href="/admin/usage" hidden><span class="nav-icon" aria-hidden="true">▥</span>用量<span class="nav-live">历史</span></a>
+      <div class="nav-label">配置</div>
+      <a class="nav-link active" href="#channels" data-view="channels" aria-current="page"><span class="nav-icon" aria-hidden="true">⊞</span>渠道<span id="nav-channel-count" class="nav-count">—</span></a>
+      <a class="nav-link" href="#models" data-view="models"><span class="nav-icon" aria-hidden="true">⑂</span>模型路由<span id="nav-model-count" class="nav-count">—</span></a>
+      <a class="nav-link" href="#aliases" data-view="aliases"><span class="nav-icon" aria-hidden="true">↗</span>别名</a>
+      <div class="nav-label">系统</div>
+      <a class="nav-link" href="#environment" data-view="environment"><span class="nav-icon" aria-hidden="true">⚙︎</span>环境</a>
+      <a class="nav-link" href="#runtime" data-view="runtime"><span class="nav-icon" aria-hidden="true">≡</span>运行态</a>
+    </nav>
+    <div class="sidebar-footer"><span class="sidebar-dot"></span><div>Anthropic Messages 代理<small>配置与可观测性</small></div><span class="footer-version">v1</span></div>
+  </aside>
 
-  <main class="content-grid">
-    <section class="config-column">
-      <div class="section">
-        <div class="section-header">Providers</div>
-        <div class="section-body">
-          <h3 class="subsection-title">Primary Provider (env)</h3>
-          <table id="primary-table"><thead><tr><th>Key</th><th>Value</th><th>Secret</th></tr></thead><tbody></tbody></table>
-          <div class="subsection-heading">
-            <h3>Fallback Providers</h3>
-            <button id="btn-add-fallback" type="button">+ Add Fallback</button>
-          </div>
-          <table id="fallback-table"><thead><tr><th>Move</th><th>Name</th><th>Base URL</th><th>Key Mode</th><th>Key Env</th><th>No cooldown</th><th>Configured</th><th>Actions</th></tr></thead><tbody></tbody></table>
-        </div>
+  <div class="app-main">
+    <header class="topbar">
+      <div class="breadcrumb">工作区 <span>/</span> <strong id="page-breadcrumb">渠道</strong></div>
+      <div class="topbar-status"><span id="topbar-runtime-version" class="badge">运行态 —</span><span id="topbar-active-requests" class="badge">活跃 —</span></div>
+    </header>
+
+    <main id="main-content" class="content-grid" tabindex="-1">
+      <div class="page-heading">
+        <div class="page-heading-copy"><div class="eyebrow">网关配置</div><h1 id="page-title">渠道</h1><p id="page-description">管理渠道、模型路由与运行环境。</p></div>
+        <div class="topbar-actions btn-row"><button id="btn-validate" type="button"><span aria-hidden="true">✓</span> 校验</button><button id="btn-save" type="button" class="primary"><span aria-hidden="true">↥</span> 保存更改</button></div>
       </div>
 
-      <div class="section">
-        <div class="section-header">Model Mappings</div>
-        <div class="section-body">
-          <div id="model-mappings-list"></div>
-          <div class="btn-row section-footer">
-            <button id="btn-add-mapping">+ Add Mapping</button>
-          </div>
-        </div>
+      <div class="connection-bar"><div id="instance-summary" class="meta-row">正在加载实例…</div><div id="status" class="notice notice-info" role="status" aria-live="polite">正在连接…</div><span id="dirty-badge" class="badge badge-ok" style="display:none">有未保存更改</span></div>
+      <div class="feedback-stack" aria-live="polite"><div id="restart-notice" style="display:none"></div><div id="validation-result"></div><div id="action-result"></div></div>
+
+      <section class="summary-grid" aria-label="草稿配置概览">
+        <a class="summary-card" href="#channels"><div class="summary-label">渠道数量 <span aria-hidden="true">↗</span></div><div id="summary-channels" class="summary-value">—</div><div class="summary-note">已配置上游</div></a>
+        <a class="summary-card" href="#models"><div class="summary-label">模型路由数量 <span aria-hidden="true">⑂</span></div><div id="summary-models" class="summary-value">—</div><div class="summary-note">按优先级排列的渠道</div></a>
+        <a class="summary-card" href="#aliases"><div class="summary-label">模型别名数量 <span aria-hidden="true">↗</span></div><div id="summary-aliases" class="summary-value">—</div><div class="summary-note">供客户端使用的名称</div></a>
+        <a class="summary-card summary-featured" href="#models"><div class="summary-label">默认模型 <span aria-hidden="true">✳</span></div><div id="summary-default" class="summary-value summary-model">—</div><div class="summary-note">请求未指定模型时使用</div></a>
+      </section>
+
+      <div class="config-column">
+        <section id="channels" class="config-view" aria-labelledby="channels-title">
+          <div class="section-toolbar"><div><h2 id="channels-title">渠道列表 <span id="channel-count" class="count-badge">0</span></h2><p>配置各上游渠道的地址与凭据。</p></div><div class="toolbar-actions"><label class="search-field"><span aria-hidden="true">⌕</span><input id="channel-search" type="search" placeholder="搜索渠道…" aria-label="搜索渠道"></label><button id="btn-add-channel" type="button" class="primary">+ 添加渠道</button></div></div>
+          <div class="section table-panel"><table id="channels-table"><caption class="sr-only">渠道配置</caption><thead><tr><th>ID</th><th>名称</th><th>Base URL</th><th>API Key</th><th>熔断</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+          <div id="channel-search-empty" class="empty-state" hidden>没有匹配的渠道。</div>
+        </section>
+
+        <section id="models" class="config-view" aria-labelledby="models-title" hidden>
+          <div class="section-toolbar"><div><h2 id="models-title">模型路由</h2><p>拖动 ⠿ 调整渠道优先级；保存后生效。</p></div><button id="btn-add-model-route" type="button" class="primary">+ 添加路由</button></div>
+          <div class="default-model-panel"><div><label for="default-model-input">默认模型</label><p>客户端未指定模型时采用此默认值。</p></div><input id="default-model-input" type="text" autocomplete="off" placeholder="规范模型或别名"></div>
+          <div id="model-routes-list"></div>
+        </section>
+
+        <section id="aliases" class="config-view" aria-labelledby="aliases-title" hidden>
+          <div class="section-toolbar"><div><h2 id="aliases-title">模型别名</h2><p>为客户端提供易记名称，路由仍使用规范模型。</p></div><button id="btn-add-alias" type="button" class="primary">+ 添加别名</button></div><div id="aliases-list"></div>
+        </section>
+
+        <section id="environment" class="config-view" aria-labelledby="environment-title" hidden>
+          <div class="section-toolbar"><div><h2 id="environment-title">环境设置</h2><p>监听地址、超时、Anthropic 版本与兼容选项。</p></div><label class="search-field"><span aria-hidden="true">⌕</span><input id="env-search" type="search" placeholder="搜索配置项…" aria-label="搜索环境设置"></label></div>
+          <div class="section table-panel"><table id="primary-table"><thead><tr><th>配置键</th><th>值</th><th>密钥</th></tr></thead><tbody></tbody></table><div id="env-search-empty" class="empty-state" hidden>没有匹配的配置项。</div></div>
+        </section>
+
+        <section id="runtime" class="config-view" aria-labelledby="runtime-title" hidden>
+          <div class="section-toolbar"><div><h2 id="runtime-title">运行快照</h2><p>当前加载配置与实例操作。</p></div></div>
+          <div class="overview-bar-panel"><div class="overview-bar-items"><div class="overview-bar-item"><label for="ov-version">运行版本</label><input id="ov-version" readonly></div><div class="overview-bar-item"><label for="ov-restart">需要重启</label><input id="ov-restart" readonly></div><div id="ov-instance-info" class="overview-bar-extra"></div></div></div>
+          <div class="section table-panel"><table id="runtime-table"><thead><tr><th>运行配置项</th><th>已加载值</th></tr></thead><tbody></tbody></table></div>
+        </section>
       </div>
 
-      <div class="section">
-        <div class="section-header">Runtime / Compatibility</div>
-        <div class="section-body">
-          <table id="runtime-table"><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody></tbody></table>
-        </div>
-      </div>
-    </section>
-
-    <aside class="status-column">
-      <div class="status-panel">
-        <div class="panel-title">Overview</div>
-        <div class="panel-body">
-          <div class="field-group"><label>Runtime Version</label><input id="ov-version" readonly></div>
-          <div class="field-group"><label>Restart Required Fields</label><input id="ov-restart" readonly></div>
-          <div id="ov-instance-info"></div>
-        </div>
-      </div>
-    </aside>
-  </main>
+      <footer class="workspace-footer"><span>保存后应用于此实例。</span><div class="runtime-actions"><button id="btn-reload" type="button" class="quiet">↻ 从磁盘重新加载</button><span class="footer-divider"></span><button id="btn-rollback" type="button" class="danger quiet">↶ 回滚</button></div></footer>
+    </main>
+  </div>
 </div>
 <script src="/admin/assets/admin.js"></script>
 </body>

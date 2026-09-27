@@ -10,3 +10,9 @@ sse-failures/
 .worktrees/
 instances/proxy-*/
 docs/superpowers/
+
+# parity migration workspace (baseline snapshots, evidence, probes)
+.parity/
+
+# 本地部署手册（不入库）
+DEPLOY.local.md

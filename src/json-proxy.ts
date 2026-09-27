@@ -37,27 +37,14 @@ import {
   synthesizeResponseFromEvents,
   writeBufferedResponsesSse,
 } from './responses-sse.js';
-import { createAdminHandler } from './admin-api.js';
-import { createConfigFileStoreFromPaths } from './config-files.js';
 import { createRuntimeConfigStore, createEndpointStateKey, type RuntimeConfigStore, type RuntimeSnapshot } from './runtime-config.js';
 
 bootstrapHttpProxySupport();
 
 const _envPath = process.env.PROXY_ENV_PATH ?? resolve('.env');
 const runtimeStore = createRuntimeConfigStore({ envPath: _envPath });
-
-const _adminConfigStore = createConfigFileStoreFromPaths({
-  envPath: _envPath,
-  fallbackPath: runtimeStore.getSnapshot().config.fallbackConfigPath,
-  modelMapPath: runtimeStore.getSnapshot().config.modelMappingPath,
-});
-const _adminHandler = createAdminHandler({
-  configStore: _adminConfigStore,
-  runtimeStore,
-  getAdminStats: () => getAdminStats(),
-  clearResponseCache: () => clearResponseCache(),
-  responseCacheSize: () => responseCache.size,
-});
+// Legacy Responses handler: the admin API now serves the Anthropic channels/models config,
+// so this dormant module is intentionally not wired to /admin.
 
 const _initialSnapshot = runtimeStore.getSnapshot();
 const _requestContext = new AsyncLocalStorage<RuntimeSnapshot<ProxyRuntimeConfig>>();
@@ -2573,15 +2560,6 @@ const server = createServer((req, res) => {
     if (!req.url) {
       sendJson(res, 404, makeError('Not found', 404).body);
       finish(404, 'missing url');
-      return;
-    }
-
-    const _adminHandled = await _adminHandler(req, res);
-    if (_adminHandled) {
-      if ((req.url ?? '').split(/[?#]/)[0] === '/admin/monitor/stats') {
-        return;
-      }
-      finish(200, 'admin config api handled');
       return;
     }
 

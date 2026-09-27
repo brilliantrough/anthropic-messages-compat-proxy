@@ -12,7 +12,7 @@ else
 fi
 
 INTERVAL_SECONDS="${WAIT_PROXY_IDLE_INTERVAL:-0.5}"
-SERVICE_NAME="${WAIT_PROXY_IDLE_SERVICE:-responses-proxy@${INSTANCE_NAME}}"
+SERVICE_NAME="${WAIT_PROXY_IDLE_SERVICE:-anthropic-messages-proxy@${INSTANCE_NAME}}"
 STATUS_URL="${WAIT_PROXY_IDLE_STATUS_URL:-http://127.0.0.1:${PORT}/healthz}"
 
 if ! command -v curl >/dev/null 2>&1; then

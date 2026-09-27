@@ -8,7 +8,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { getAvailablePort } from './_helpers.js';
+import { getAvailablePort, instanceEnvPath, writeRoutingConfig } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -99,6 +99,11 @@ async function main() {
     'utf8',
   );
 
+  const routingConfigPath = await writeRoutingConfig(tempDir, {
+    primary: { name: 'hanging-primary', baseUrl: `http://127.0.0.1:${primaryAddress.port}`, apiKey: 'test-key' },
+    legacyFallbackPath: fallbackConfigPath,
+  });
+
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
     cwd: workspaceRoot,
@@ -107,16 +112,15 @@ async function main() {
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
       INSTANCE_NAME: 'anthropic-proxy-timeout-check',
-      PRIMARY_PROVIDER_NAME: 'hanging-primary',
-      PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
-      PRIMARY_PROVIDER_API_KEY: 'test-key',
-      FALLBACK_CONFIG_PATH: fallbackConfigPath,
+
+      PROXY_ENV_PATH: instanceEnvPath(tempDir),
+      PROXY_CHANNEL_MAX_ATTEMPTS: '1',
+      FALLBACK_CONFIG_PATH: routingConfigPath,
       // Short timeout to make the test fast
       PROXY_UPSTREAM_TIMEOUT_MS: '3000',
       PROXY_NON_STREAM_TIMEOUT_MS: '3000',
       PROXY_FIRST_BYTE_TIMEOUT_MS: '3000',
       PROXY_STREAM_IDLE_TIMEOUT_MS: '3000',
-      PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS: '5000',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -156,15 +160,16 @@ async function main() {
     // --- Check that endpoint health shows the timeout ---
     const statsResponse = await fetch(`http://127.0.0.1:${proxyPort}/admin/stats`);
     const stats = await statsResponse.json() as Record<string, unknown>;
-    const endpointHealth = stats.endpointHealth as Array<Record<string, unknown>>;
+    const healthSnapshot = stats.healthSnapshot as { channels?: Array<Record<string, unknown>> };
+    const channels = healthSnapshot.channels ?? [];
 
-    assert.ok(Array.isArray(endpointHealth), 'endpointHealth should be an array');
+    assert.ok(Array.isArray(channels), 'healthSnapshot.channels should be an array');
 
-    const primaryHealth = endpointHealth.find(e => e.name === 'hanging-primary');
-    assert.ok(primaryHealth, 'should have health record for hanging-primary');
+    const primaryHealth = channels.find(e => e.channelId === 'primary');
+    assert.ok(primaryHealth, 'should have health record for primary channel');
 
     assert.ok(primaryHealth.failureCount !== undefined && (primaryHealth.failureCount as number) >= 1);
-    assert.equal(primaryHealth.lastFailureReason, 'connect_timeout', 'connect timeout should be classified distinctly');
+    assert.equal(primaryHealth.lastFailureReason, 'timeout', 'timeout should use the normalized health reason');
 
     // Verify admin stats has upstreamTimeouts counter
     const statsCounters = stats.stats as Record<string, unknown> | undefined;

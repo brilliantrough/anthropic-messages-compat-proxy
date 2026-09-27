@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,6 +7,7 @@ import path from 'node:path';
 import { createConfigFileStoreFromPaths } from '../src/config-files.js';
 import { createRuntimeConfigStore } from '../src/runtime-config.js';
 import { createAdminHandler } from '../src/admin-api.js';
+import { createHealthRegistry } from '../src/channel-health.js';
 
 const allTempDirs: string[] = [];
 const allServers: import('node:http').Server[] = [];
@@ -17,10 +18,8 @@ function makeTempDir() {
   return dir;
 }
 
-function startServer(
-  handler: (req: IncomingMessage, res: ServerResponse) => Promise<boolean>,
-): Promise<{ server: import('node:http').Server; port: number }> {
-  return new Promise((resolve, reject) => {
+function startServer(handler: (req: IncomingMessage, res: ServerResponse) => Promise<boolean>) {
+  return new Promise<{ server: import('node:http').Server; port: number }>((resolve, reject) => {
     const server = createServer(async (req, res) => {
       const handled = await handler(req, res);
       if (!handled && !res.headersSent && !res.writableEnded) {
@@ -30,249 +29,219 @@ function startServer(
     });
     allServers.push(server);
     server.listen(0, '127.0.0.1', () => {
-      const addr = server.address();
-      if (typeof addr === 'object' && addr) {
-        resolve({ server, port: addr.port });
-      } else {
-        reject(new Error('Failed to get server address'));
-      }
+      const address = server.address();
+      if (typeof address === 'object' && address) resolve({ server, port: address.port });
+      else reject(new Error('Failed to get server address'));
     });
   });
 }
 
+const routingDocument = {
+  default_model: 'claude-opus-4-8',
+  channels: [
+    { id: 'primary', name: 'Primary', base_url: 'https://api.anthropic.test', api_key: 'test-key-123' },
+    { id: 'fallback-a', name: 'Fallback A', base_url: 'https://fallback.test', api_key: 'fb-key' },
+  ],
+  models: { 'claude-opus-4-8': { channel_ids: ['primary', 'fallback-a'] } },
+  aliases: { 'claude-latest': 'claude-opus-4-8' },
+};
+
 async function main() {
   try {
-    const expectedRuntimeDefaults = {
-      PROXY_UPSTREAM_TIMEOUT_MS: '30000',
-      PROXY_NON_STREAM_TIMEOUT_MS: '300000',
-      PROXY_FIRST_BYTE_TIMEOUT_MS: '30000',
-      PROXY_FIRST_TEXT_TIMEOUT_MS: '12000',
-      PROXY_STREAM_IDLE_TIMEOUT_MS: '60000',
-      PROXY_TOTAL_REQUEST_TIMEOUT_MS: '600000',
-      PROXY_MAX_CONCURRENT_REQUESTS: '128',
-      PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS: '120000',
-      PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS: '120000',
-      PROXY_ENDPOINT_AUTH_COOLDOWN_MS: '1800000',
-      PROXY_ENDPOINT_FAILURE_THRESHOLD: '1',
-      PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES: '1',
-      PROXY_MAX_FALLBACK_TOTAL_MS: '30000',
-    } as const;
-
-    console.log('=== 1. Setup with Anthropic env keys in .env ===');
+    console.log('=== 1. Setup with the channels/models/aliases config ===');
     const configDir = makeTempDir();
     const envPath = path.join(configDir, '.env');
-    const fallbackPath = path.join(configDir, 'fallback.json');
-    const modelMapPath = path.join(configDir, 'model-map.json');
-
-    writeFileSync(fallbackPath, JSON.stringify({ fallback_api_config: [] }, null, 2), 'utf8');
-    writeFileSync(modelMapPath, JSON.stringify({ model_mappings: {} }, null, 2), 'utf8');
+    const routingPath = path.join(configDir, 'fallback.json');
+    writeFileSync(routingPath, JSON.stringify(routingDocument, null, 2), 'utf8');
     writeFileSync(envPath, [
-      'PRIMARY_PROVIDER_NAME=anthropic-test',
-      'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.test',
-      'PRIMARY_PROVIDER_API_KEY=test-key-123',
       'ANTHROPIC_VERSION=2023-06-01',
       'ANTHROPIC_BETA=max-tokens-3-5-sonnet-2024-07-15',
       'PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line',
-      `FALLBACK_CONFIG_PATH=${fallbackPath}`,
-      `MODEL_MAP_PATH=${modelMapPath}`,
+      'HOST=127.0.0.1',
+      'PORT=12241',
+      `FALLBACK_CONFIG_PATH=${routingPath}`,
     ].join('\n'), 'utf8');
 
     const runtimeStore = createRuntimeConfigStore({ envPath, mode: 'anthropic' });
-    const snap = runtimeStore.getSnapshot();
-    const configStore = createConfigFileStoreFromPaths({
-      envPath,
-      fallbackPath: snap.config.fallbackConfigPath,
-      modelMapPath: snap.config.modelMappingPath,
-    });
-    const adminHandler = createAdminHandler({ configStore, runtimeStore });
+    const healthRegistry = createHealthRegistry({});
+    runtimeStore.registerHealthRegistry(healthRegistry);
+    const configStore = createConfigFileStoreFromPaths({ envPath, fallbackPath: routingPath });
+    const adminHandler = createAdminHandler({ configStore, runtimeStore, healthRegistry });
     const { port } = await startServer(adminHandler);
     const baseUrl = `http://127.0.0.1:${port}`;
 
-    console.log('=== 2. GET /admin/config exposes ANTHROPIC_VERSION ===');
+    console.log('=== 2. GET /admin/config exposes env, channels, models, aliases and policy ===');
     const configRes = await fetch(`${baseUrl}/admin/config`);
     assert.equal(configRes.status, 200);
-    const configBody = (await configRes.json()) as Record<string, unknown>;
-    const config = configBody.config as Record<string, unknown>;
-    const envArr = config.env as Array<Record<string, unknown>>;
+    const configBody = (await configRes.json()) as { ok?: boolean; config?: Record<string, unknown>; runtimeVersion?: number; restartRequiredFields?: string[] };
+    assert.equal(configBody.ok, true);
+    assert.equal(configBody.runtimeVersion, 1);
+    const config = configBody.config as {
+      env: Array<{ key: string; value: string; secret?: boolean }>;
+      defaultModel: string;
+      channels: Array<{ id: string; name?: string; baseUrl?: string; apiKeyMasked?: string; apiKeyConfigured?: boolean; disableCooldown?: boolean }>;
+      models: Array<{ canonicalModel: string; channelIds: string[] }>;
+      aliases: Record<string, string>;
+      legacyModelMapPath: string;
+    };
+    assert.ok(config.env.some(entry => entry.key === 'ANTHROPIC_VERSION' && entry.value === '2023-06-01'));
+    assert.ok(config.env.some(entry => entry.key === 'PROXY_CHANNEL_MAX_ATTEMPTS'), 'policy defaults are editable from the UI');
+    assert.equal(config.env.find(entry => entry.key === 'PROXY_CHANNEL_RETRY_DELAY_MS')?.value, '500');
+    assert.equal(config.defaultModel, 'claude-opus-4-8');
+    assert.deepEqual(config.channels.map(channel => channel.id), ['primary', 'fallback-a']);
+    assert.equal(config.channels[0]?.apiKeyConfigured, true, 'the UI learns that a key exists without receiving it');
+    assert.equal(config.channels[0]?.apiKeyMasked, '***', 'the UI only receives a masked placeholder');
+    assert.equal(JSON.stringify(config).includes('test-key-123'), false, 'GET /admin/config never returns credentials');
+    assert.equal(JSON.stringify(config).includes('fb-key'), false);
+    assert.deepEqual(config.models, [{ canonicalModel: 'claude-opus-4-8', channelIds: ['primary', 'fallback-a'] }]);
+    assert.deepEqual(config.aliases, { 'claude-latest': 'claude-opus-4-8' });
+    assert.equal(config.legacyModelMapPath, path.join(configDir, 'model-map.json'), 'the legacy model-map path is still reported but never read');
 
-    const versionEntry = envArr.find(e => e.key === 'ANTHROPIC_VERSION');
-    assert.ok(versionEntry, 'ANTHROPIC_VERSION should appear in admin env');
-    assert.equal(versionEntry.value, '2023-06-01', 'ANTHROPIC_VERSION should have correct value');
-
-    console.log('=== 3. GET /admin/config exposes ANTHROPIC_BETA ===');
-    const betaEntry = envArr.find(e => e.key === 'ANTHROPIC_BETA');
-    assert.ok(betaEntry, 'ANTHROPIC_BETA should appear in admin env');
-    assert.equal(betaEntry.value, 'max-tokens-3-5-sonnet-2024-07-15', 'ANTHROPIC_BETA should have correct value');
-
-    console.log('=== 4. GET /admin/config exposes PROXY_CLAUDE_BILLING_HEADER_MODE ===');
-    const billingEntry = envArr.find(e => e.key === 'PROXY_CLAUDE_BILLING_HEADER_MODE');
-    assert.ok(billingEntry, 'PROXY_CLAUDE_BILLING_HEADER_MODE should appear in admin env');
-    assert.equal(billingEntry.value, 'strip_line', 'PROXY_CLAUDE_BILLING_HEADER_MODE should have correct value');
-
-    console.log('=== 5. Snapshot exposes anthropicVersion and anthropicBeta ===');
-    assert.equal(snap.config.anthropicVersion, '2023-06-01', 'snapshot should have anthropicVersion');
-    assert.equal(snap.config.anthropicBeta, 'max-tokens-3-5-sonnet-2024-07-15', 'snapshot should have anthropicBeta');
-
-    console.log('=== 6. Snapshot exposes upstreamMessagesUrl and upstreamModelsUrl ===');
-    assert.equal(snap.config.upstreamMessagesUrl, 'https://api.anthropic.test/v1/messages');
-    assert.equal(snap.config.upstreamModelsUrl, 'https://api.anthropic.test/v1/models');
-
-    console.log('=== 7. ANTHROPIC_VERSION appears as default even without explicit .env entry ===');
-    const configDir2 = makeTempDir();
-    const envPath2 = path.join(configDir2, '.env');
-    const fallbackPath2 = path.join(configDir2, 'fallback.json');
-    const modelMapPath2 = path.join(configDir2, 'model-map.json');
-
-    writeFileSync(fallbackPath2, JSON.stringify({ fallback_api_config: [] }, null, 2), 'utf8');
-    writeFileSync(modelMapPath2, JSON.stringify({ model_mappings: {} }, null, 2), 'utf8');
-    writeFileSync(envPath2, [
-      'PRIMARY_PROVIDER_NAME=anthropic-test',
-      'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.test',
-      'PRIMARY_PROVIDER_API_KEY=test-key-456',
-      `FALLBACK_CONFIG_PATH=${fallbackPath2}`,
-      `MODEL_MAP_PATH=${modelMapPath2}`,
-    ].join('\n'), 'utf8');
-
-    const runtimeStore2 = createRuntimeConfigStore({ envPath: envPath2, mode: 'anthropic' });
-    const snap2 = runtimeStore2.getSnapshot();
-    const configStore2 = createConfigFileStoreFromPaths({
-      envPath: envPath2,
-      fallbackPath: snap2.config.fallbackConfigPath,
-      modelMapPath: snap2.config.modelMappingPath,
-    });
-    const adminHandler2 = createAdminHandler({ configStore: configStore2, runtimeStore: runtimeStore2 });
-    const { port: port2 } = await startServer(adminHandler2);
-    const baseUrl2 = `http://127.0.0.1:${port2}`;
-
-    const configRes2 = await fetch(`${baseUrl2}/admin/config`);
-    assert.equal(configRes2.status, 200);
-    const configBody2 = (await configRes2.json()) as Record<string, unknown>;
-    const config2 = configBody2.config as Record<string, unknown>;
-    const envArr2 = config2.env as Array<Record<string, unknown>>;
-
-    const defaultVersionEntry = envArr2.find(e => e.key === 'ANTHROPIC_VERSION');
-    assert.ok(defaultVersionEntry, 'ANTHROPIC_VERSION should appear in admin env even without explicit .env entry');
-    assert.equal(defaultVersionEntry.value, '2023-06-01', 'ANTHROPIC_VERSION should have default value');
-
-    const defaultBillingEntry = envArr2.find(e => e.key === 'PROXY_CLAUDE_BILLING_HEADER_MODE');
-    assert.ok(defaultBillingEntry, 'PROXY_CLAUDE_BILLING_HEADER_MODE should appear as default');
-    assert.equal(defaultBillingEntry.value, 'strip_line');
-
-    console.log('=== 8. Timeout and fallback runtime defaults appear in admin env even when omitted ===');
-    for (const [key, expectedValue] of Object.entries(expectedRuntimeDefaults)) {
-      const entry = envArr2.find(e => e.key === key);
-      assert.ok(entry, `${key} should appear in admin env as a default`);
-      assert.equal(entry.value, expectedValue, `${key} should have default value ${expectedValue}`);
-    }
-
-    const defaultAttemptsEntry = envArr2.find(e => e.key === 'PROXY_MAX_FALLBACK_ATTEMPTS');
-    assert.ok(defaultAttemptsEntry, 'PROXY_MAX_FALLBACK_ATTEMPTS should appear in admin env as a derived default');
-    assert.equal(defaultAttemptsEntry.value, '1', 'PROXY_MAX_FALLBACK_ATTEMPTS should default to 1 when no fallback providers exist');
-
-    console.log('=== 9. Derived fallback-attempt default tracks fallback provider count ===');
-    const configDir3 = makeTempDir();
-    const envPath3 = path.join(configDir3, '.env');
-    const fallbackPath3 = path.join(configDir3, 'fallback.json');
-    const modelMapPath3 = path.join(configDir3, 'model-map.json');
-
-    writeFileSync(fallbackPath3, JSON.stringify({
-      fallback_api_config: [
-        { name: 'fallback-a', base_url: 'https://fallback-a.example', api_key: 'key-a' },
-        { name: 'fallback-b', base_url: 'https://fallback-b.example', api_key: 'key-b' },
+    console.log('=== 3. POST /admin/config/validate accepts a good draft and rejects a bad one ===');
+    const goodDraft = {
+      env: [{ key: 'ANTHROPIC_VERSION', value: '2023-06-01' }, { key: 'PROXY_CHANNEL_MAX_ATTEMPTS', value: '2' }],
+      defaultModel: 'claude-opus-4-8',
+      channels: [
+        { id: 'primary', name: 'Primary', baseUrl: 'https://api.anthropic.test', apiKeyAction: 'keep' },
+        { id: 'fallback-a', name: 'Fallback A', baseUrl: 'https://fallback.test', apiKeyAction: 'keep' },
       ],
-    }, null, 2), 'utf8');
-    writeFileSync(modelMapPath3, JSON.stringify({ model_mappings: {} }, null, 2), 'utf8');
-    writeFileSync(envPath3, [
-      'PRIMARY_PROVIDER_NAME=anthropic-test',
-      'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.test',
-      'PRIMARY_PROVIDER_API_KEY=test-key-789',
-      `FALLBACK_CONFIG_PATH=${fallbackPath3}`,
-      `MODEL_MAP_PATH=${modelMapPath3}`,
-    ].join('\n'), 'utf8');
+      models: [{ canonicalModel: 'claude-opus-4-8', channelIds: ['primary', 'fallback-a'] }],
+      aliases: { 'claude-latest': 'claude-opus-4-8' },
+    };
+    const validated = await fetch(`${baseUrl}/admin/config/validate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(goodDraft) });
+    assert.equal(validated.status, 200);
+    const validatedBody = (await validated.json()) as { Ok?: boolean; ok?: boolean; valid?: boolean; errors?: string[] };
+    assert.equal(validatedBody.valid, true);
 
-    const runtimeStore3 = createRuntimeConfigStore({ envPath: envPath3, mode: 'anthropic' });
-    const snap3 = runtimeStore3.getSnapshot();
-    const configStore3 = createConfigFileStoreFromPaths({
-      envPath: envPath3,
-      fallbackPath: snap3.config.fallbackConfigPath,
-      modelMapPath: snap3.config.modelMappingPath,
+    const badPolicy = await fetch(`${baseUrl}/admin/config/validate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...goodDraft, env: [{ key: 'PROXY_CHANNEL_MAX_ATTEMPTS', value: '0' }] }),
     });
-    const adminHandler3 = createAdminHandler({ configStore: configStore3, runtimeStore: runtimeStore3 });
-    const { port: port3 } = await startServer(adminHandler3);
-    const baseUrl3 = `http://127.0.0.1:${port3}`;
+    const badPolicyBody = (await badPolicy.json()) as { valid?: boolean; errors?: string[] };
+    assert.equal(badPolicyBody.valid, false);
+    assert.match(badPolicyBody.errors?.join(' ') ?? '', /PROXY_CHANNEL_MAX_ATTEMPTS/);
 
-    const configRes3 = await fetch(`${baseUrl3}/admin/config`);
-    assert.equal(configRes3.status, 200);
-    const configBody3 = (await configRes3.json()) as Record<string, unknown>;
-    const config3 = configBody3.config as Record<string, unknown>;
-    const envArr3 = config3.env as Array<Record<string, unknown>>;
-    const derivedAttemptsEntry = envArr3.find(e => e.key === 'PROXY_MAX_FALLBACK_ATTEMPTS');
-    assert.ok(derivedAttemptsEntry, 'PROXY_MAX_FALLBACK_ATTEMPTS should appear with fallback providers present');
-    assert.equal(derivedAttemptsEntry.value, '2', 'PROXY_MAX_FALLBACK_ATTEMPTS should default to fallback provider count when env is omitted');
+    const badRouting = await fetch(`${baseUrl}/admin/config/validate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...goodDraft, models: [{ canonicalModel: 'claude-opus-4-8', channelIds: ['nope'] }] }),
+    });
+    const badRoutingBody = (await badRouting.json()) as { valid?: boolean; errors?: string[] };
+    assert.equal(badRoutingBody.valid, false);
+    assert.match(badRoutingBody.errors?.join(' ') ?? '', /unknown channel id/);
 
-    console.log('=== 10. Admin runtime table allowlist includes fallback/timeout entries ===');
-    const adminJs = readFileSync(path.resolve(import.meta.dirname, '..', 'public', 'admin', 'assets', 'admin.js'), 'utf8');
-    const requiredRuntimeKeys = [
-      ...Object.keys(expectedRuntimeDefaults),
-      'PROXY_MAX_FALLBACK_ATTEMPTS',
-    ];
-    for (const key of requiredRuntimeKeys) {
-      assert.ok(adminJs.includes(`'${key}'`), `${key} should be included in admin.js runtime allowlist`);
-    }
+    console.log('=== 4. PUT /admin/config writes both files atomically with backups ===');
+    const envBefore = readFileSync(envPath, 'utf8');
+    const putRes = await fetch(`${baseUrl}/admin/config`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        env: [{ key: 'ANTHROPIC_VERSION', value: '2024-01-01' }, { key: 'PROXY_CHANNEL_MAX_ATTEMPTS', value: '2' }],
+        defaultModel: 'claude-opus-4-8',
+        channels: [
+          { id: 'primary', name: 'Primary renamed', baseUrl: 'https://api.anthropic.test', apiKeyAction: 'keep' },
+          { id: 'fallback-a', name: 'Fallback A', baseUrl: 'https://fallback.test', apiKeyAction: 'keep' },
+        ],
+        models: [
+          { canonicalModel: 'claude-opus-4-8', channelIds: ['primary', 'fallback-a'] },
+          { canonicalModel: 'claude-sonnet-4-6', channelIds: ['fallback-a'] },
+        ],
+        aliases: { 'claude-latest': 'claude-opus-4-8', 'claude-sonnet-latest': 'claude-sonnet-4-6' },
+      }),
+    });
+    assert.equal(putRes.status, 200);
+    const putBody = (await putRes.json()) as { ok?: boolean; runtimeVersion?: number };
+    assert.equal(putBody.ok, true);
+    assert.equal(putBody.runtimeVersion, 2, 'a successful PUT reloads the runtime in place');
+    assert.equal(readFileSync(`${envPath}.bak`, 'utf8'), envBefore, 'the previous .env is kept as a 0600 backup');
+    assert.equal(statSync(envPath).mode & 0o777, 0o600);
+    assert.equal(statSync(routingPath).mode & 0o777, 0o600);
+    const snapshot = runtimeStore.getSnapshot();
+    assert.equal(snapshot.config.anthropicVersion, '2024-01-01');
+    assert.equal(snapshot.config.channelMaxAttempts, 2);
+    assert.equal(snapshot.config.routingConfig.modelRoutes.size, 2);
+    assert.equal(snapshot.config.routingConfig.aliases['claude-sonnet-latest'], 'claude-sonnet-4-6');
+    assert.equal(healthRegistry.snapshot().channels.length, 2, 'the live health topology follows the new routing document');
 
-    console.log('=== 11. HTML renders the redesigned shared admin shell ===');
-    const htmlRes = await fetch(`${baseUrl}/admin`);
-    assert.equal(htmlRes.status, 200);
-    const html = await htmlRes.text();
-    const requiredShellClasses = [
-      'admin-shell',
-      'topbar',
-      'content-grid',
-      'config-column',
-      'status-column',
-    ];
-    for (const cls of requiredShellClasses) {
-      assert.ok(
-        html.includes(cls),
-        `anthropic admin page should render the shared admin shell class "${cls}"`,
-      );
-    }
+    console.log('=== 5. POST /admin/config/reload applies an out-of-band edit ===');
+    writeFileSync(routingPath, JSON.stringify({
+      ...routingDocument,
+      aliases: { 'claude-latest': 'claude-opus-4-8', 'claude-edited': 'claude-opus-4-8' },
+    }, null, 2), 'utf8');
+    const reloadRes = await fetch(`${baseUrl}/admin/config/reload`, { method: 'POST' });
+    assert.equal(reloadRes.status, 200);
+    assert.equal(runtimeStore.getSnapshot().config.routingConfig.aliases['claude-edited'], 'claude-opus-4-8');
 
-    console.log('=== 12. HTML renders the redesigned notice and status panel structure ===');
-    assert.ok(
-      html.includes('status-panel'),
-      'anthropic admin page should render the read-only status panel',
-    );
-    assert.ok(
-      html.includes('panel-title'),
-      'anthropic admin page should render compact panel titles',
-    );
+    console.log('=== 6. POST /admin/config/rollback restores the 0600 backups ===');
+    writeFileSync(envPath, 'BROKEN=1\n', 'utf8');
+    const rollbackRes = await fetch(`${baseUrl}/admin/config/rollback`, { method: 'POST' });
+    assert.equal(rollbackRes.status, 200);
+    const rollbackBody = (await rollbackRes.json()) as { ok?: boolean; restored?: string[] };
+    assert.equal(rollbackBody.ok, true);
+    assert.ok(rollbackBody.restored?.includes(envPath), `expected the env file to be restored, got ${JSON.stringify(rollbackBody.restored)}`);
+    assert.ok(rollbackBody.restored?.includes(routingPath), 'expected the routing file to be restored');
+    assert.equal(readFileSync(envPath, 'utf8').includes('ANTHROPIC_VERSION=2023-06-01'), true, 'the env backup is restored');
+    assert.equal(statSync(envPath).mode & 0o777, 0o600);
 
-    console.log('=== 13. JS uses the redesigned model mapping editor structure ===');
-    assert.ok(
-      adminJs.includes('mapping-row'),
-      'anthropic model mapping renderer should use the redesigned mapping row class',
-    );
-    assert.ok(
-      adminJs.includes('mapping-arrow'),
-      'anthropic model mapping renderer should render the visual mapping arrow',
-    );
-
-    console.log('=== 14. JS uses the redesigned provider/fallback editor structure ===');
-    assert.ok(
-      adminJs.includes('fallback-row'),
-      'anthropic fallback renderer should emit redesigned fallback rows',
-    );
+    console.log('=== 7. Remote admin calls are rejected unless PROXY_ADMIN_ALLOW_HOST is set ===');
+    const localDir = makeTempDir();
+    const localEnv = path.join(localDir, '.env');
+    const localRouting = path.join(localDir, 'fallback.json');
+    writeFileSync(localRouting, JSON.stringify(routingDocument, null, 2), 'utf8');
+    writeFileSync(localEnv, ['HOST=0.0.0.0', 'PORT=12241', `FALLBACK_CONFIG_PATH=${localRouting}`].join('\n'), 'utf8');
+    const localStore = createRuntimeConfigStore({ envPath: localEnv, mode: 'anthropic' });
+    const localHandler = createAdminHandler({
+      configStore: createConfigFileStoreFromPaths({ envPath: localEnv, fallbackPath: localRouting }),
+      runtimeStore: localStore,
+      healthRegistry: createHealthRegistry({}),
+    });
+    const remoteResponse = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const server = createServer(async (req, res) => {
+        // Present the request as coming from a public address while still being reachable on loopback.
+        const fakeRequest = {
+          method: req.method,
+          url: req.url,
+          headers: req.headers,
+          socket: { remoteAddress: '203.0.113.7' },
+          on: () => fakeRequest,
+          resume: () => undefined,
+        };
+        const handled = await localHandler(fakeRequest as unknown as IncomingMessage, res);
+        if (!handled && !res.headersSent) {
+          res.writeHead(404).end();
+        }
+      });
+      allServers.push(server);
+      server.listen(0, '127.0.0.1', async () => {
+        const address = server.address();
+        if (typeof address !== 'object' || !address) {
+          reject(new Error('no address'));
+          return;
+        }
+        try {
+          const response = await fetch(`http://127.0.0.1:${address.port}/admin/config`);
+          resolve({ status: response.status, body: await response.text() });
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    assert.equal(remoteResponse.status, 403, 'admin routes are loopback-only unless explicitly allowed');
+    assert.match(remoteResponse.body, /local/i);
 
     console.log('\nAll anthropic-admin-config-api checks passed.');
   } finally {
     for (const server of allServers) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-    for (const d of allTempDirs) {
-      rmSync(d, { recursive: true, force: true });
+    for (const dir of allTempDirs) {
+      rmSync(dir, { recursive: true, force: true });
     }
   }
 }
 
-main();
+main().catch(error => {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exitCode = 1;
+});

@@ -1,46 +1,31 @@
 import { readFileSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { parse as dotenvParse } from 'dotenv';
 import type { ClaudeBillingHeaderMode } from './responses-input-normalization.js';
 import { isEnabled } from './proxy-config.js';
+import { loadRoutingConfig, type RoutingConfig } from './routing-config.js';
+import { LEGACY_ROUTING_ENV_KEYS, readRoutingPolicyConfig, routingPolicyDefaults } from './routing-policy.js';
 
 export type StreamMode = 'normalized' | 'raw';
-
-export type UpstreamEndpoint = {
-  name: string;
-  url: string;
-  apiKey: string;
-  isFallback: boolean;
-  disableCooldown?: boolean;
-};
 
 export type AnthropicRuntimeConfig = {
   host: string;
   port: number;
   instanceName: string;
-  primaryProviderName: string;
-  primaryProviderBaseUrl: string;
-  apiKey: string;
-  upstreamMessagesUrl: string;
-  upstreamModelsUrl: string;
+  adminAllowHost: boolean;
+  routingConfigPath: string;
+  routingConfig: RoutingConfig;
   anthropicVersion: string;
   anthropicBeta: string | undefined;
-  defaultModel: string;
-  modelMappings: Record<string, string>;
   claudeBillingHeaderMode: ClaudeBillingHeaderMode;
-  primaryEndpoint: UpstreamEndpoint;
-  fallbackEndpoints: UpstreamEndpoint[];
-  allEndpoints: UpstreamEndpoint[];
-  adminAllowHost: boolean;
-  endpointTimeoutCooldownMs: number;
-  endpointInvalidResponseCooldownMs: number;
-  endpointAuthCooldownMs: number;
-  endpointFailureThreshold: number;
-  endpointHalfOpenMaxProbes: number;
-  maxFallbackAttempts: number;
+  healthWindowMs: number;
+  healthFailureThreshold: number;
+  healthFailureRateThreshold: number;
+  healthCooldownMs: number;
+  channelMaxAttempts: number;
+  channelRetryDelayMs: number;
+  quotaCooldownMs: number;
   maxFallbackTotalMs: number;
-  fallbackConfigPath: string;
-  modelMappingPath: string;
   upstreamTimeoutMs: number;
   nonStreamingRequestTimeoutMs: number;
   firstByteTimeoutMs: number;
@@ -59,15 +44,12 @@ export type AnthropicRuntimeConfig = {
   fallbackOnCompat4xx: boolean;
   compatFallbackPatterns: string[];
   clientErrorPatterns: string[];
+  usageDbPath: string;
 };
 
 function parseStreamMode(value: string | undefined): StreamMode {
   const normalized = value?.trim().toLowerCase();
   return normalized === 'raw' ? 'raw' : 'normalized';
-}
-
-function normalizeBaseUrl(baseUrl: string) {
-  return baseUrl.replace(/\/+$/, '');
 }
 
 function parseEnvList(value: string | undefined, defaults: string[]): string[] {
@@ -94,164 +76,44 @@ function parseClaudeBillingHeaderMode(value: string | undefined): ClaudeBillingH
   return 'strip_line';
 }
 
-type FallbackApiConfig = {
-  name: string;
-  base_url: string;
-  api_key?: string;
-  api_key_env?: string;
-  disable_cooldown?: boolean;
-};
-
-function isFallbackApiConfig(value: unknown): value is FallbackApiConfig {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'name' in value &&
-    'base_url' in value &&
-    typeof (value as FallbackApiConfig).name === 'string' &&
-    typeof (value as FallbackApiConfig).base_url === 'string' &&
-    ((('api_key' in value) && typeof (value as FallbackApiConfig).api_key === 'string') ||
-      (('api_key_env' in value) && typeof (value as FallbackApiConfig).api_key_env === 'string'))
-  );
-}
-
-function resolveFallbackApiKey(item: FallbackApiConfig, env: Record<string, string | undefined>) {
-  if (typeof item.api_key === 'string' && item.api_key.length > 0) {
-    return item.api_key;
-  }
-  if (typeof item.api_key_env === 'string' && item.api_key_env.length > 0) {
-    return env[item.api_key_env];
-  }
-  return undefined;
-}
-
-export function loadFallbackEndpoints(fallbackConfigPath: string, env: Record<string, string | undefined>) {
-  try {
-    const raw = readFileSync(fallbackConfigPath, 'utf8');
-    const parsed = JSON.parse(raw) as { fallback_api_config?: unknown };
-
-    if (!Array.isArray(parsed.fallback_api_config)) {
-      return [] as UpstreamEndpoint[];
-    }
-
-    return parsed.fallback_api_config
-      .filter(isFallbackApiConfig)
-      .flatMap(item => {
-        const resolvedApiKey = resolveFallbackApiKey(item, env);
-        if (!resolvedApiKey) {
-          console.warn(
-            `Skipping fallback '${item.name}' from ${fallbackConfigPath}: missing api_key or unresolved api_key_env`,
-          );
-          return [] as UpstreamEndpoint[];
-        }
-        return [{
-          name: item.name,
-          url: `${normalizeBaseUrl(item.base_url)}/v1/messages`,
-          apiKey: resolvedApiKey,
-          isFallback: true,
-          disableCooldown: item.disable_cooldown === true,
-        }];
-      });
-  } catch (error) {
-    console.warn(
-      `Failed to load fallback API config from ${fallbackConfigPath}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return [] as UpstreamEndpoint[];
-  }
-}
-
-function normalizeModelMappings(value: unknown) {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return {} as Record<string, string>;
-  }
-  const mappings: Record<string, string> = {};
-  for (const [alias, target] of Object.entries(value)) {
-    if (typeof target !== 'string') continue;
-    const normalizedAlias = alias.trim();
-    const normalizedTarget = target.trim();
-    if (normalizedAlias.length === 0 || normalizedTarget.length === 0) continue;
-    mappings[normalizedAlias] = normalizedTarget;
-  }
-  return mappings;
-}
-
-function loadModelMappings(modelMappingPath: string) {
-  try {
-    const raw = readFileSync(modelMappingPath, 'utf8');
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const mappingSource =
-      typeof parsed === 'object' && parsed !== null && 'model_mappings' in parsed
-        ? parsed.model_mappings
-        : parsed;
-    return normalizeModelMappings(mappingSource);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
-      return {} as Record<string, string>;
-    }
-    console.warn(
-      `Failed to load model mapping config from ${modelMappingPath}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return {} as Record<string, string>;
-  }
-}
-
-export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntimeConfig {
-  const envPath = join(configDir, '.env');
-
+export function readInstanceEnv(envPath: string): NodeJS.ProcessEnv {
   let fileEnv: Record<string, string> = {};
   try {
-    const raw = readFileSync(envPath, 'utf8');
-    fileEnv = dotenvParse(raw);
-  } catch {}
+    fileEnv = dotenvParse(readFileSync(envPath, 'utf8'));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      throw err;
+    }
+  }
+  return { ...process.env, ...fileEnv };
+}
 
-  const env: Record<string, string | undefined> = { ...process.env, ...fileEnv };
-  const fallbackPath = resolve(env.FALLBACK_CONFIG_PATH ?? join(configDir, 'fallback.json'));
-  const modelMapPath = resolve(env.MODEL_MAP_PATH ?? join(configDir, 'model-map.json'));
+export function createAnthropicRuntimeConfig(envPath: string): AnthropicRuntimeConfig {
+  const resolvedEnvPath = resolve(envPath);
+  const configDir = dirname(resolvedEnvPath);
+  const env = readInstanceEnv(resolvedEnvPath);
 
-  const apiKey = env.PRIMARY_PROVIDER_API_KEY;
-  if (!apiKey) {
-    throw new Error('Missing PRIMARY_PROVIDER_API_KEY in environment');
+  const routingConfigPath = resolve(env.FALLBACK_CONFIG_PATH ?? join(configDir, 'fallback.json'));
+  const routingConfig = loadRoutingConfig(routingConfigPath);
+
+  const legacyPrimaryKeys = ['PRIMARY_PROVIDER_NAME', 'PRIMARY_PROVIDER_BASE_URL', 'PRIMARY_PROVIDER_API_KEY', 'PRIMARY_PROVIDER_DEFAULT_MODEL']
+    .filter(key => env[key] !== undefined);
+  if (legacyPrimaryKeys.length > 0) {
+    console.warn(`PRIMARY_PROVIDER_* variables are ignored (${legacyPrimaryKeys.join(', ')}); channels and models come from ${routingConfigPath}`);
+  }
+  const legacyRoutingKeys = LEGACY_ROUTING_ENV_KEYS.filter(key => env[key] !== undefined);
+  if (legacyRoutingKeys.length > 0) {
+    console.warn(`Legacy endpoint health settings ignored: ${legacyRoutingKeys.join(', ')}; use the PROXY_HEALTH_* / PROXY_CHANNEL_* rolling-window policy`);
+  }
+  if (env.MODEL_MAP_PATH !== undefined) {
+    console.warn('MODEL_MAP_PATH is ignored; aliases come from the routing config');
   }
 
   const host = env.HOST ?? '0.0.0.0';
   const port = Number(env.PORT ?? 11234);
   const instanceName = env.INSTANCE_NAME ?? `anthropic-proxy-${port}`;
-  const primaryProviderName = env.PRIMARY_PROVIDER_NAME ?? 'primary-provider';
-  const primaryProviderBaseUrl = normalizeBaseUrl(env.PRIMARY_PROVIDER_BASE_URL ?? 'https://api.anthropic.com');
-  const upstreamMessagesUrl = `${primaryProviderBaseUrl}/v1/messages`;
-  const upstreamModelsUrl = `${primaryProviderBaseUrl}/v1/models`;
-  const anthropicVersion = env.ANTHROPIC_VERSION ?? '2023-06-01';
-  const anthropicBeta = env.ANTHROPIC_BETA?.trim() || undefined;
-  const defaultModel = env.PRIMARY_PROVIDER_DEFAULT_MODEL ?? 'claude-sonnet-4-5';
-  const claudeBillingHeaderMode = parseClaudeBillingHeaderMode(env.PROXY_CLAUDE_BILLING_HEADER_MODE);
-  const fallbackEndpoints = loadFallbackEndpoints(fallbackPath, env);
-  const endpointTimeoutCooldownMs = Number(env.PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS ?? 120000);
-  const endpointInvalidResponseCooldownMs = Number(env.PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS ?? 120000);
-  const endpointAuthCooldownMs = Number(env.PROXY_ENDPOINT_AUTH_COOLDOWN_MS ?? 1800000);
-  const endpointFailureThreshold = Number(env.PROXY_ENDPOINT_FAILURE_THRESHOLD ?? 1);
-  const endpointHalfOpenMaxProbes = Number(env.PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES ?? 1);
-  const maxFallbackAttempts = Number(env.PROXY_MAX_FALLBACK_ATTEMPTS ?? Math.max(1, fallbackEndpoints.length));
+  const policy = readRoutingPolicyConfig(env);
   const maxFallbackTotalMs = Number(env.PROXY_MAX_FALLBACK_TOTAL_MS ?? 30000);
-
-  const upstreamTimeoutMs = Number(env.PROXY_UPSTREAM_TIMEOUT_MS ?? 30000);
-  const nonStreamingRequestTimeoutMs = Number(env.PROXY_NON_STREAM_TIMEOUT_MS ?? 300000);
-  const firstByteTimeoutMs = Number(env.PROXY_FIRST_BYTE_TIMEOUT_MS ?? 30000);
-  const firstTextTimeoutMs = Number(env.PROXY_FIRST_TEXT_TIMEOUT_MS ?? 12000);
-  const streamIdleTimeoutMs = Number(env.PROXY_STREAM_IDLE_TIMEOUT_MS ?? 60000);
-  const totalRequestTimeoutMs = Number(env.PROXY_TOTAL_REQUEST_TIMEOUT_MS ?? 600000);
-  const maxConcurrentRequests = Number(env.PROXY_MAX_CONCURRENT_REQUESTS ?? 128);
-  const defaultStreamMode = parseStreamMode(env.PROXY_STREAM_MODE);
-  const logRequestBodies = isEnabled(env.PROXY_LOG_REQUEST_BODY);
-  const debugSse = isEnabled(env.PROXY_DEBUG_SSE);
-  const sseFailureDebugEnabled = isEnabled(env.PROXY_SSE_FAILURE_DEBUG);
-  const sseFailureDebugDir = resolve(env.PROXY_SSE_FAILURE_DIR ?? join(configDir, 'captures', instanceName, 'sse-failures'));
-  const streamMissingUsageDebugEnabled = isEnabled(env.PROXY_STREAM_MISSING_USAGE_DEBUG);
-  const streamMissingUsageDebugDir = resolve(
-    env.PROXY_STREAM_MISSING_USAGE_DIR ?? join(configDir, 'captures', instanceName, 'stream', 'missing-usage'),
-  );
-
-  const fallbackOnRetryable4xx = isEnabled(env.PROXY_FALLBACK_ON_RETRYABLE_4XX, true);
-  const fallbackOnCompat4xx = isEnabled(env.PROXY_FALLBACK_ON_COMPAT_4XX, true);
   const defaultCompatFallbackPatterns = [
     'model not found',
     'unsupported model',
@@ -265,69 +127,48 @@ export function createAnthropicRuntimeConfig(configDir: string): AnthropicRuntim
     'maximum context length',
     'context length exceeded',
     'too many input tokens',
+    'prompt is too long',
     'invalid tool schema',
     'json schema is invalid',
   ];
-  const compatFallbackPatterns = parseEnvList(env.PROXY_FALLBACK_COMPAT_PATTERNS, defaultCompatFallbackPatterns);
-  const clientErrorPatterns = parseEnvList(
-    env.PROXY_NO_FALLBACK_CLIENT_ERROR_PATTERNS ?? env.PROXY_FALLBACK_CLIENT_ERROR_PATTERNS,
-    defaultClientErrorPatterns,
-  );
-
-  const primaryEndpoint: UpstreamEndpoint = {
-    name: primaryProviderName,
-    url: upstreamMessagesUrl,
-    apiKey,
-    isFallback: false,
-  };
-
-  const modelMappings = loadModelMappings(modelMapPath);
-  const allEndpoints = [primaryEndpoint, ...fallbackEndpoints];
 
   return {
     host,
     port,
     instanceName,
-    primaryProviderName,
-    primaryProviderBaseUrl,
-    apiKey,
-    upstreamMessagesUrl,
-    upstreamModelsUrl,
-    anthropicVersion,
-    anthropicBeta,
-    defaultModel,
-    modelMappings,
-    claudeBillingHeaderMode,
-    primaryEndpoint,
-    fallbackEndpoints,
-    allEndpoints,
     adminAllowHost: isEnabled(env.PROXY_ADMIN_ALLOW_HOST),
-    endpointTimeoutCooldownMs,
-    endpointInvalidResponseCooldownMs,
-    endpointAuthCooldownMs,
-    endpointFailureThreshold,
-    endpointHalfOpenMaxProbes,
-    maxFallbackAttempts,
+    routingConfigPath,
+    routingConfig,
+    anthropicVersion: env.ANTHROPIC_VERSION ?? '2023-06-01',
+    anthropicBeta: env.ANTHROPIC_BETA?.trim() || undefined,
+    claudeBillingHeaderMode: parseClaudeBillingHeaderMode(env.PROXY_CLAUDE_BILLING_HEADER_MODE),
+    ...policy,
     maxFallbackTotalMs,
-    fallbackConfigPath: resolve(fallbackPath),
-    modelMappingPath: resolve(modelMapPath),
-    upstreamTimeoutMs,
-    nonStreamingRequestTimeoutMs,
-    firstByteTimeoutMs,
-    firstTextTimeoutMs,
-    streamIdleTimeoutMs,
-    totalRequestTimeoutMs,
-    maxConcurrentRequests,
-    defaultStreamMode,
-    logRequestBodies,
-    debugSse,
-    sseFailureDebugEnabled,
-    sseFailureDebugDir,
-    streamMissingUsageDebugEnabled,
-    streamMissingUsageDebugDir,
-    fallbackOnRetryable4xx,
-    fallbackOnCompat4xx,
-    compatFallbackPatterns,
-    clientErrorPatterns,
+    upstreamTimeoutMs: Number(env.PROXY_UPSTREAM_TIMEOUT_MS ?? 30000),
+    nonStreamingRequestTimeoutMs: Number(env.PROXY_NON_STREAM_TIMEOUT_MS ?? 300000),
+    firstByteTimeoutMs: Number(env.PROXY_FIRST_BYTE_TIMEOUT_MS ?? 30000),
+    firstTextTimeoutMs: Number(env.PROXY_FIRST_TEXT_TIMEOUT_MS ?? 12000),
+    streamIdleTimeoutMs: Number(env.PROXY_STREAM_IDLE_TIMEOUT_MS ?? 60000),
+    totalRequestTimeoutMs: Number(env.PROXY_TOTAL_REQUEST_TIMEOUT_MS ?? 600000),
+    maxConcurrentRequests: Number(env.PROXY_MAX_CONCURRENT_REQUESTS ?? 128),
+    defaultStreamMode: parseStreamMode(env.PROXY_STREAM_MODE),
+    logRequestBodies: isEnabled(env.PROXY_LOG_REQUEST_BODY),
+    debugSse: isEnabled(env.PROXY_DEBUG_SSE),
+    sseFailureDebugEnabled: isEnabled(env.PROXY_SSE_FAILURE_DEBUG),
+    sseFailureDebugDir: resolve(env.PROXY_SSE_FAILURE_DIR ?? join(configDir, 'captures', instanceName, 'sse-failures')),
+    streamMissingUsageDebugEnabled: isEnabled(env.PROXY_STREAM_MISSING_USAGE_DEBUG),
+    streamMissingUsageDebugDir: resolve(
+      env.PROXY_STREAM_MISSING_USAGE_DIR ?? join(configDir, 'captures', instanceName, 'stream', 'missing-usage'),
+    ),
+    fallbackOnRetryable4xx: isEnabled(env.PROXY_FALLBACK_ON_RETRYABLE_4XX, true),
+    fallbackOnCompat4xx: isEnabled(env.PROXY_FALLBACK_ON_COMPAT_4XX, true),
+    compatFallbackPatterns: parseEnvList(env.PROXY_FALLBACK_COMPAT_PATTERNS, defaultCompatFallbackPatterns),
+    clientErrorPatterns: parseEnvList(
+      env.PROXY_NO_FALLBACK_CLIENT_ERROR_PATTERNS ?? env.PROXY_FALLBACK_CLIENT_ERROR_PATTERNS,
+      defaultClientErrorPatterns,
+    ),
+    usageDbPath: resolve(env.PROXY_USAGE_DB_PATH ?? join(configDir, 'usage.sqlite')),
   };
 }
+
+export { routingPolicyDefaults };

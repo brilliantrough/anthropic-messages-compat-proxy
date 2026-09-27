@@ -8,7 +8,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { getAvailablePort } from './_helpers.js';
+import { getAvailablePort, instanceEnvPath, writeRoutingConfig } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -116,6 +116,11 @@ async function main() {
     'utf8',
   );
 
+  const routingConfigPath = await writeRoutingConfig(tempDir, {
+    primary: { name: 'timeout-primary', baseUrl: `http://127.0.0.1:${primaryAddress.port}`, apiKey: 'primary-key' },
+    legacyFallbackPath: fallbackConfigPath,
+  });
+
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
     cwd: workspaceRoot,
@@ -124,10 +129,10 @@ async function main() {
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
       INSTANCE_NAME: 'anthropic-proxy-stream-timeout-fallback-check',
-      PRIMARY_PROVIDER_NAME: 'timeout-primary',
-      PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
-      PRIMARY_PROVIDER_API_KEY: 'primary-key',
-      FALLBACK_CONFIG_PATH: fallbackConfigPath,
+
+      PROXY_ENV_PATH: instanceEnvPath(tempDir),
+      PROXY_CHANNEL_MAX_ATTEMPTS: '1',
+      FALLBACK_CONFIG_PATH: routingConfigPath,
       PROXY_FIRST_TEXT_TIMEOUT_MS: '100',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -161,11 +166,11 @@ async function main() {
     const statsResponse = await fetch(`http://127.0.0.1:${proxyPort}/admin/stats`);
     assert.equal(statsResponse.status, 200);
     const stats = await statsResponse.json() as {
-      endpointHealth?: Array<{ name?: string; lastFailureReason?: string | null }>;
+      healthSnapshot?: { channels?: Array<{ channelId?: string; lastFailureReason?: string | null }> };
       stats?: { upstreamTimeouts?: number };
     };
-    const primaryHealth = stats.endpointHealth?.find(item => item.name === 'timeout-primary');
-    assert.equal(primaryHealth?.lastFailureReason, 'headers_only_timeout');
+    const primaryHealth = stats.healthSnapshot?.channels?.find(item => item.channelId === 'primary');
+    assert.equal(primaryHealth?.lastFailureReason, 'timeout');
     assert.ok((stats.stats?.upstreamTimeouts ?? 0) >= 1, 'expected upstream timeout counter to increment');
 
     const stdoutText = stdout.join('');

@@ -8,7 +8,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { getAvailablePort } from './_helpers.js';
+import { getAvailablePort, instanceEnvPath, writeRoutingConfig } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -87,6 +87,12 @@ async function main() {
 
   const proxyPort = await getAvailablePort();
 
+  const routingConfigPath = await writeRoutingConfig(tempDir, {
+    primary: { name: 'primary', baseUrl: `http://127.0.0.1:${primaryAddress.port}`, apiKey: 'test-key' },
+    models: ['claude-sonnet-4-5'],
+    aliases: { 'client-alias': 'claude-sonnet-4-5' },
+  });
+
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
     cwd: workspaceRoot,
@@ -95,9 +101,8 @@ async function main() {
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
       INSTANCE_NAME: 'anthropic-proxy-progressive-check',
-      PRIMARY_PROVIDER_NAME: 'primary',
-      PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
-      PRIMARY_PROVIDER_API_KEY: 'test-key',
+      PROXY_ENV_PATH: instanceEnvPath(tempDir),
+      FALLBACK_CONFIG_PATH: routingConfigPath,
       PROXY_UPSTREAM_TIMEOUT_MS: '30000',
       PROXY_FIRST_BYTE_TIMEOUT_MS: '15000',
       PROXY_FIRST_TEXT_TIMEOUT_MS: '15000',

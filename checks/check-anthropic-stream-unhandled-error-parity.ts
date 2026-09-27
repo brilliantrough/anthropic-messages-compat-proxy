@@ -3,7 +3,8 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 
 import { createAnthropicProxyServer } from '../src/anthropic-proxy.js';
-import { createEndpointHealthStore } from '../src/proxy-core.js';
+import { createHealthRegistry } from '../src/channel-health.js';
+import { healthRecord, routingFixture, throwingOnceRegistry } from './_helpers.js';
 import { createProxyStats } from '../src/anthropic-messages-handler.js';
 
 async function main() {
@@ -47,29 +48,12 @@ async function main() {
   const upstreamAddress = upstream.address();
   assert.ok(upstreamAddress && typeof upstreamAddress !== 'string');
 
-  const primaryEndpoint = {
-    name: 'primary',
-    url: `http://127.0.0.1:${upstreamAddress.port}/v1/messages`,
-    apiKey: 'test-key',
-    isFallback: false,
-  };
-
-  const realStore = createEndpointHealthStore({
-    endpointTimeoutCooldownMs: 120000,
-    endpointInvalidResponseCooldownMs: 120000,
-    endpointAuthCooldownMs: 1800000,
-    endpointFailureThreshold: 1,
-    endpointHalfOpenMaxProbes: 1,
+  const routingConfig = routingFixture({
+    primary: { name: 'primary', baseUrl: `http://127.0.0.1:${upstreamAddress.port}`, apiKey: 'test-key' },
+    models: ['claude-sonnet-4-5'],
   });
-  const wrappedStore = {
-    ...realStore,
-    markEndpointSuccess(endpoint: typeof primaryEndpoint) {
-      if (endpoint.name === 'primary') {
-        throw new Error('boom-stream-success-hook');
-      }
-      realStore.markEndpointSuccess(endpoint);
-    },
-  };
+  const realStore = createHealthRegistry({ healthFailureThreshold: 1, healthCooldownMs: 120000, healthWindowMs: 180000 });
+  const wrappedStore = throwingOnceRegistry(realStore);
   const stats = createProxyStats();
   const captured: string[] = [];
   const originalLog = console.log;
@@ -82,12 +66,10 @@ async function main() {
     port: 0,
     host: '127.0.0.1',
     instanceName: 'anthropic-stream-unhandled-parity-check',
-    primaryProviderName: 'primary',
-    primaryProviderBaseUrl: `http://127.0.0.1:${upstreamAddress.port}`,
-    apiKey: 'test-key',
     anthropicVersion: '2023-06-01',
+    routingConfig,
     defaultStreamMode: 'normalized',
-    endpointHealthStore: wrappedStore,
+    healthRegistry: wrappedStore,
     stats,
   });
 
@@ -108,8 +90,8 @@ async function main() {
     const text = await response.text();
     assert.match(text, /hello stream/);
 
-    const health = realStore.getSnapshot(primaryEndpoint);
-    assert.equal(health.lastFailureReason, 'proxy_unhandled_error');
+    const health = healthRecord(realStore, 'primary');
+    assert.equal(health.lastFailureReason, 'proxy_internal');
     assert.equal(stats.fallbackReasons.proxyUnhandledError, 1);
     assert.equal(captured.some(line => line.includes('unhandled proxy error after response commit')), true);
 

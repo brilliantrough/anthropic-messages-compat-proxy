@@ -1,9 +1,22 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { type ClaudeBillingHeaderMode, type JsonValue, type JsonRecord } from './responses-input-normalization.js';
 import { normalizeAnthropicMessageRequest } from './anthropic-input-normalization.js';
-import type { UpstreamEndpoint, StreamMode } from './anthropic-config.js';
+import type { StreamMode } from './anthropic-config.js';
+import type { ChannelConfig } from './routing-config.js';
+import { resolveModelRoute } from './model-router.js';
+import type { FailureEvidence, HealthLease, HealthRegistry } from './channel-health.js';
+import {
+  createChannelAttempts,
+  createFallbackBudget,
+  hasBudgetLeft,
+  peekNextChannel,
+  reportChannelFailure,
+  reportChannelSuccess,
+  selectNextChannel,
+  waitForRetryDelay,
+} from './upstream-router.js';
+import { beginUsageAttempt, type AnthropicUsageObservation, type UsageContext } from './usage-tracking.js';
 import { getAnthropicFallbackReason, isAnthropicMessageWithUsableContent, type AnthropicFallbackReason } from './anthropic-errors.js';
-import { buildEndpointOrder, createFallbackBudget, canFallback, type EndpointHealthStore } from './proxy-core.js';
 import {
   sendJson,
   makeAnthropicError,
@@ -62,6 +75,8 @@ function createFallbackReasonBuckets() {
     compat4xx: 0,
     unknownUpstreamError: 0,
     headersOnlyTimeout: 0,
+    streamTimeoutAfterText: 0,
+    streamErrorAfterText: 0,
     streamNoTextContent: 0,
     streamMissingUsage: 0,
     emptyResponse: 0,
@@ -78,6 +93,8 @@ function createFallbackByUpstreamBuckets() {
     compat4xx: 0,
     unknownUpstreamError: 0,
     headersOnlyTimeout: 0,
+    streamTimeoutAfterText: 0,
+    streamErrorAfterText: 0,
     streamNoTextContent: 0,
     streamMissingUsage: 0,
     emptyResponse: 0,
@@ -119,6 +136,8 @@ export function recordFallbackReason(stats: ProxyStats, reason: string, upstream
     if (reason === 'retryable_4xx') return 'retryable4xx';
     if (reason === 'compat_4xx') return 'compat4xx';
     if (reason === 'headers_only_timeout' || reason === 'connect_timeout' || reason === 'body_timeout') return 'headersOnlyTimeout';
+    if (reason === 'stream_timeout_after_text') return 'streamTimeoutAfterText';
+    if (reason === 'stream_error_after_text') return 'streamErrorAfterText';
     if (reason === 'stream_no_text_content') return 'streamNoTextContent';
     if (reason === 'stream_missing_usage') return 'streamMissingUsage';
     if (reason === 'empty_response') return 'emptyResponse';
@@ -153,16 +172,16 @@ export function recordStatus(stats: ProxyStats, statusCode: number) {
 
 export type AnthropicMessagesHandlerOptions = {
   requestId: string;
-  primaryEndpoint: UpstreamEndpoint;
-  fallbackEndpoints: UpstreamEndpoint[];
+  routingConfig: import('./routing-config.js').RoutingConfig;
+  healthRegistry: HealthRegistry;
+  channelMaxAttempts: number;
+  channelRetryDelayMs: number;
+  usageContext: UsageContext;
   anthropicVersion: string;
   anthropicBeta: string | undefined;
   defaultModel: string;
-  modelMappings: Record<string, string>;
   claudeBillingHeaderMode: ClaudeBillingHeaderMode;
-  maxFallbackAttempts: number;
   maxFallbackTotalMs: number;
-  endpointHealthStore: EndpointHealthStore;
   upstreamTimeoutMs: number;
   nonStreamingRequestTimeoutMs: number;
   firstByteTimeoutMs: number;
@@ -201,7 +220,7 @@ type AbortReason =
 
 type StreamOutcome =
   | { kind: 'completed'; wroteTextContent: boolean; wroteAnyEvent: boolean; startedStreaming: boolean; chunkCount: number; totalBytes: number; textCharCount: number; usage?: AnthropicStreamUsage; fallbackReason?: AnthropicFallbackReason }
-  | { kind: 'timeout'; phase: string; wroteTextContent: boolean; wroteAnyEvent: boolean; startedStreaming: boolean; chunkCount: number; totalBytes: number; textCharCount: number; fallbackReason?: AnthropicFallbackReason }
+  | { kind: 'timeout'; phase: Extract<AbortReason, { kind: 'timeout' }>['phase']; wroteTextContent: boolean; wroteAnyEvent: boolean; startedStreaming: boolean; chunkCount: number; totalBytes: number; textCharCount: number; fallbackReason?: AnthropicFallbackReason }
   | { kind: 'client_disconnect'; source?: 'request' | 'response'; wroteTextContent: boolean; wroteAnyEvent: boolean; startedStreaming: boolean; chunkCount: number; totalBytes: number; textCharCount: number }
   | { kind: 'error'; wroteTextContent: boolean; wroteAnyEvent: boolean; startedStreaming: boolean; chunkCount: number; totalBytes: number; textCharCount: number; error: unknown; fallbackReason?: AnthropicFallbackReason };
 
@@ -657,8 +676,19 @@ async function pipeProgressiveSse(
   };
 }
 
-function handleSseFallbackExhausted(res: ServerResponse) {
-  sendJson(res, 502, makeAnthropicError('api_error', 'All upstream endpoints exhausted'));
+function handleFallbackExhausted(res: ServerResponse, reason: string | null) {
+  sendJson(res, 502, makeAnthropicError('api_error', `All configured channels failed for this model (fallback_exhausted)${reason ? `: ${reason}` : ''}`));
+}
+
+function handleModelChannelsUnavailable(res: ServerResponse, retryAfterMs: number) {
+  if (res.writableEnded || res.destroyed || res.headersSent) return;
+  res.writeHead(503, {
+    'content-type': 'application/json; charset=utf-8',
+    'retry-after': String(Math.max(1, Math.ceil(retryAfterMs / 1000))),
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+  });
+  res.end(JSON.stringify(makeAnthropicError('api_error', 'No configured channel is currently available for this model (model_channels_unavailable)'), null, 2));
 }
 
 function getFallbackBudgetRemainingMs(startedAt: number, maxFallbackTotalMs: number) {
@@ -666,84 +696,6 @@ function getFallbackBudgetRemainingMs(startedAt: number, maxFallbackTotalMs: num
     return null;
   }
   return Math.max(0, maxFallbackTotalMs - (Date.now() - startedAt));
-}
-
-function logUnavailableEndpoint(options: AnthropicMessagesHandlerOptions, endpoint: UpstreamEndpoint) {
-  const before = options.endpointHealthStore.getSnapshot(endpoint);
-  const available = options.endpointHealthStore.isEndpointAvailable(endpoint);
-  const after = options.endpointHealthStore.getSnapshot(endpoint);
-
-  if (before.state === 'open' && after.state === 'half_open') {
-    options.logRequest('endpoint circuit moved to half-open', {
-      upstreamName: endpoint.name,
-      upstreamUrl: endpoint.url,
-      previousFailureReason: before.lastFailureReason,
-    });
-  }
-
-  if (!available) {
-    if (before.state === 'open' && before.remainingMs > 0) {
-      options.logRequest('skipping upstream during circuit cooldown', {
-        upstreamName: endpoint.name,
-        upstreamUrl: endpoint.url,
-        remainingMs: before.remainingMs,
-        lastFailureReason: before.lastFailureReason,
-        endpointHealth: before,
-      });
-    } else if (after.state === 'half_open') {
-      options.logRequest('skipping upstream because half-open probe is already in flight', {
-        upstreamName: endpoint.name,
-        upstreamUrl: endpoint.url,
-        halfOpenProbeInFlight: after.halfOpenProbeInFlight,
-        endpointHealth: after,
-      });
-    }
-  }
-
-  return available;
-}
-
-function markEndpointFailureWithLog(
-  options: AnthropicMessagesHandlerOptions,
-  endpoint: UpstreamEndpoint,
-  reason: AnthropicFallbackReason,
-) {
-  const before = options.endpointHealthStore.getSnapshot(endpoint);
-  options.endpointHealthStore.markEndpointFailure(endpoint, reason);
-  const after = options.endpointHealthStore.getSnapshot(endpoint);
-
-  if (after.state === 'open' && (before.state !== 'open' || before.cooldownUntil !== after.cooldownUntil)) {
-    options.logRequest('endpoint circuit opened', {
-      upstreamName: endpoint.name,
-      upstreamUrl: endpoint.url,
-      failureReason: reason,
-      cooldownMs: after.remainingMs,
-      failureCount: after.failureCount,
-      endpointHealth: after,
-    });
-    return;
-  }
-
-  options.logRequest('endpoint failure recorded without cooldown', {
-    upstreamName: endpoint.name,
-    upstreamUrl: endpoint.url,
-    failureReason: reason,
-    failureCount: after.failureCount,
-    endpointHealth: after,
-  });
-}
-
-function markEndpointSuccessWithLog(options: AnthropicMessagesHandlerOptions, endpoint: UpstreamEndpoint) {
-  const before = options.endpointHealthStore.getSnapshot(endpoint);
-  options.endpointHealthStore.markEndpointSuccess(endpoint);
-  if (before.state !== 'closed' || before.failureCount > 0) {
-    options.logRequest('endpoint circuit recovered', {
-      upstreamName: endpoint.name,
-      upstreamUrl: endpoint.url,
-      previousState: before.state,
-      previousFailureReason: before.lastFailureReason,
-    });
-  }
 }
 
 export async function handleMessagesRequest(
@@ -762,9 +714,14 @@ export async function handleMessagesRequest(
     active: options.stats.activeRequests,
   });
   const requestedModel = getRequestedModel(requestBody, options.defaultModel);
+  const route = resolveModelRoute(requestBody.model, options.routingConfig);
+  if ('code' in route) {
+    options.finish(400, 'model is not configured', { requestedModel: route.requestedModel, modelNotConfigured: true });
+    sendJson(res, 400, makeAnthropicError('invalid_request_error', `model '${route.requestedModel}' is not configured (model_not_configured)`));
+    return;
+  }
   const upstreamBody = normalizeAnthropicMessageRequest(requestBody, {
-    defaultModel: options.defaultModel,
-    modelMappings: options.modelMappings,
+    canonicalModel: route.canonicalModel,
     claudeBillingHeaderMode: options.claudeBillingHeaderMode,
   });
   logRequestBodiesPreview(options.requestId, requestBody, upstreamBody, {
@@ -772,48 +729,129 @@ export async function handleMessagesRequest(
     claudeBillingHeaderMode: options.claudeBillingHeaderMode,
   });
 
-  const endpoints = buildEndpointOrder(options.primaryEndpoint, options.fallbackEndpoints);
+  const attempts = createChannelAttempts(options.channelMaxAttempts);
   const budget = createFallbackBudget();
   let pendingFallbackReason: AnthropicFallbackReason | null = null;
+  let attemptIndex = 0;
+  let isFallbackAttempt = false;
+  let channelId = '';
+  let channelName = '';
+  let lease: HealthLease | undefined;
+  let currentAttempt: ReturnType<typeof beginUsageAttempt> | undefined;
 
-  for (let i = 0; i < endpoints.length; i++) {
-    const endpoint = endpoints[i];
-    if (!logUnavailableEndpoint(options, endpoint)) {
-      continue;
+  // The total request deadline lives outside the attempt loop so retries, retry pacing and
+  // channel switches all share one budget instead of restarting it per attempt.
+  const requestController = new AbortController();
+  const totalTimer = options.totalRequestTimeoutMs > 0
+    ? setTimeout(() => {
+      if (!requestController.signal.aborted) {
+        requestController.abort({ kind: 'timeout', phase: 'total' } satisfies AbortReason);
+      }
+    }, options.totalRequestTimeoutMs)
+    : undefined;
+  const clearTotalTimer = () => { if (totalTimer) clearTimeout(totalTimer); };
+  const onRequestClose = () => {
+    if (!requestController.signal.aborted) {
+      requestController.abort({ kind: 'client_disconnect', source: 'request' } satisfies AbortReason);
     }
-    if (endpoint.isFallback || i > 0) {
+  };
+  req.on('close', onRequestClose);
+
+  const healthSnapshotFor = (id: string) => options.healthRegistry.snapshot().channels.find(record => record.channelId === id) ?? null;
+  const peekNextChannelName = () => peekNextChannel(route, options.routingConfig, options.healthRegistry, attempts)?.name ?? null;
+  const canRetry = () =>
+    hasBudgetLeft(budget, options.maxFallbackTotalMs) &&
+    !requestController.signal.aborted &&
+    peekNextChannel(route, options.routingConfig, options.healthRegistry, attempts) !== undefined;
+  const markFailure = (reason: string, evidence: Omit<FailureEvidence, 'fallbackReason' | 'upstreamResponseObserved'> & { upstreamResponseObserved?: boolean } = {}) => {
+    if (lease === undefined) return;
+    const before = healthSnapshotFor(channelId);
+    reportChannelFailure(lease, options.healthRegistry, {
+      ...evidence,
+      fallbackReason: reason,
+      upstreamResponseObserved: evidence.upstreamResponseObserved ?? true,
+    });
+    const after = healthSnapshotFor(channelId);
+    currentAttempt?.result('failed', reason);
+    options.logRequest(after && after.remainingMs > 0 && (!before || before.remainingMs === 0) ? 'channel breaker opened' : 'channel failure recorded', {
+      upstreamName: channelName,
+      failureReason: reason,
+      failureCount: after?.windowFailures ?? null,
+      cooldownMs: after?.remainingMs ?? null,
+      channelHealth: after,
+    });
+  };
+  const markSuccess = (usage?: AnthropicUsageObservation) => {
+    if (lease === undefined) return;
+    reportChannelSuccess(lease, options.healthRegistry);
+    currentAttempt?.observe(usage);
+    currentAttempt?.result('success');
+  };
+
+  try {
+  while (true) {
+    const selection = selectNextChannel(route, options.routingConfig, options.healthRegistry, attempts);
+    if (!selection.ok) {
+      if (selection.code === 'all_unavailable' && selection.attemptedChannelIds.length === 0) {
+        options.finish(503, 'all model channels unavailable', {
+          requestedModel,
+          canonicalModel: route.canonicalModel,
+          channelIds: route.channelIds,
+          retryAfterMs: selection.retryAfterMs,
+        });
+        handleModelChannelsUnavailable(res, selection.retryAfterMs);
+        return;
+      }
+      options.finish(502, 'all upstream channels exhausted', {
+        requestedModel,
+        canonicalModel: route.canonicalModel,
+        attemptedChannelIds: selection.attemptedChannelIds,
+        fallbackReason: pendingFallbackReason,
+      });
+      handleFallbackExhausted(res, pendingFallbackReason);
+      return;
+    }
+    const selected = selection.channel;
+    channelId = selected.id;
+    channelName = selected.name;
+    lease = selection.lease;
+    if (selection.retryOfSameChannel && options.channelRetryDelayMs > 0) {
+      const waited = await waitForRetryDelay(options.channelRetryDelayMs, requestController.signal);
+      if (!waited) {
+        const abortReason = getAbortReasonFromUnknown(requestController.signal.reason);
+        if (abortReason?.kind === 'timeout') {
+          options.finish(504, 'request total timeout while pacing a same-channel retry', { upstreamName: channelName });
+          sendJson(res, 504, makeAnthropicError('api_error', 'Request total timeout elapsed before the retry could start'));
+        } else {
+          options.finish(499, 'request cancelled by client while pacing a same-channel retry', { source: 'request' });
+        }
+        return;
+      }
+    }
+    attemptIndex += 1;
+    isFallbackAttempt = attemptIndex > 1;
+    if (isFallbackAttempt) {
       options.logRequest('attempting fallback upstream', {
-        fallbackName: endpoint.name,
-        fallbackUrl: endpoint.url,
+        fallbackName: selected.name,
+        fallbackUrl: selected.messagesUrl,
         attempt: budget.attemptsUsed,
-        totalFallbacks: endpoints.length - 1,
+        totalFallbacks: route.channelIds.length - 1,
         fallbackAttemptsUsed: budget.attemptsUsed,
+        retryOfSameChannel: selection.retryOfSameChannel,
         fallbackReason: pendingFallbackReason,
         fallbackBudgetRemainingMs: getFallbackBudgetRemainingMs(budget.startedAt, options.maxFallbackTotalMs),
-        endpointHealth: options.endpointHealthStore.getSnapshot(endpoint),
+        endpointHealth: healthSnapshotFor(selected.id),
       });
     }
-    options.endpointHealthStore.reserveEndpointProbe(endpoint);
-    const headers = getOutboundHeaders(endpoint.apiKey, options.anthropicVersion, options.anthropicBeta, req.headers);
+    const headers = getOutboundHeaders(selected.apiKey, options.anthropicVersion, options.anthropicBeta, req.headers);
 
-    const parentController = new AbortController();
+    const parentController = createLinkedAbortController(requestController.signal);
     const linkedReq = req;
     const onClientClose = () => {
-      parentController.abort({ kind: 'client_disconnect', source: 'request' } satisfies AbortReason);
+      parentController.controller.abort({ kind: 'client_disconnect', source: 'request' } satisfies AbortReason);
     };
     linkedReq.on('close', onClientClose);
-
-    let totalTimer: ReturnType<typeof setTimeout> | undefined;
-    if (options.totalRequestTimeoutMs > 0) {
-      totalTimer = setTimeout(() => {
-        if (!parentController.signal.aborted) {
-          parentController.abort({ kind: 'timeout', phase: 'total' } satisfies AbortReason);
-        }
-      }, options.totalRequestTimeoutMs);
-    }
-    const clearTotalTimer = () => {
-      if (totalTimer) { clearTimeout(totalTimer); totalTimer = undefined; }
-    };
+    currentAttempt = undefined;
     let upstreamAttemptController: ReturnType<typeof createLinkedAbortController> | null = null;
 
     try {
@@ -828,11 +866,18 @@ export async function handleMessagesRequest(
         claudeBillingHeaderMode: options.claudeBillingHeaderMode,
       });
 
-      upstreamAttemptController = createLinkedAbortController(parentController.signal);
+      upstreamAttemptController = createLinkedAbortController(parentController.controller.signal);
+      currentAttempt = beginUsageAttempt(
+        options.usageContext,
+        { id: selected.id, name: selected.name },
+        route.canonicalModel,
+        'messages',
+        parentController.controller.signal,
+      );
       let upstreamResponse: Response;
       try {
         upstreamResponse = await fetchWithTimeout(
-          endpoint.url,
+          selected.messagesUrl,
           {
             method: 'POST',
             headers,
@@ -843,43 +888,42 @@ export async function handleMessagesRequest(
         );
       } catch (error) {
         linkedReq.removeListener('close', onClientClose);
-        options.endpointHealthStore.releaseEndpointProbe(endpoint);
         const abortReason = getAbortReasonFromUnknown(upstreamAttemptController?.controller.signal.reason) ?? getAbortReasonFromUnknown(error);
         if (abortReason?.kind === 'client_disconnect') {
           options.finish(499, 'request cancelled by client', {
             source: abortReason.source ?? 'request',
-            upstreamName: endpoint.name,
+            upstreamName: selected.name,
           });
           return;
         }
         const failureReason = abortReason?.kind === 'timeout' && abortReason.phase === 'connect'
           ? 'connect_timeout'
           : 'connect_error';
-        markEndpointFailureWithLog(options, endpoint, failureReason);
-        recordFallbackReason(options.stats, failureReason, endpoint.name);
+        markFailure(failureReason, { error, abortReason, upstreamResponseObserved: false });
+        recordFallbackReason(options.stats, failureReason, selected.name);
         if (failureReason === 'connect_timeout') {
           options.stats.upstreamTimeouts += 1;
         }
 
-        if (canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
+        if (canRetry()) {
           pendingFallbackReason = failureReason;
           options.logRequest(failureReason === 'connect_timeout' ? 'upstream connect timeout encountered, falling back' : 'upstream connect error encountered, falling back', {
-            upstreamName: endpoint.name,
-            upstreamUrl: endpoint.url,
+            upstreamName: selected.name,
+            upstreamUrl: selected.messagesUrl,
             phase: abortReason?.kind === 'timeout' ? abortReason.phase : undefined,
             errorName: error instanceof Error ? error.name : null,
             errorMessage: error instanceof Error ? error.message : String(error),
-            nextFallbackName: endpoints[i + 1]?.name ?? null,
+            nextFallbackName: peekNextChannelName(),
           });
           budget.attemptsUsed += 1;
           continue;
         }
 
         options.finish(502, failureReason === 'connect_timeout' ? 'upstream connect timeout' : 'upstream connect error', {
-          upstreamName: endpoint.name,
-          upstreamUrl: endpoint.url,
+          upstreamName: selected.name,
+          upstreamUrl: selected.messagesUrl,
         });
-        sendJson(res, 502, makeAnthropicError('api_error', `${failureReason === 'connect_timeout' ? 'Upstream connect timeout' : 'Upstream connect error'}: ${error instanceof Error ? error.message : String(error)}`));
+        sendJson(res, 502, makeAnthropicError('api_error', `${failureReason === 'connect_timeout' ? 'Upstream connect timeout' : 'Upstream connect error'}: ${error instanceof Error ? error.message : String(error)} (fallback_exhausted)`));
         return;
       }
 
@@ -887,12 +931,12 @@ export async function handleMessagesRequest(
 
       if (isStream) {
         options.logRequest('stream passthrough started', {
-          upstreamName: endpoint.name,
+          upstreamName: selected.name,
           upstreamStatus: upstreamResponse.status,
           upstreamContentType: upstreamResponse.headers.get('content-type') ?? '',
           streamMode,
         });
-        const streamController = createLinkedAbortController(parentController.signal).controller;
+        const streamController = createLinkedAbortController(parentController.controller.signal).controller;
         const onClientCloseStream = () => {
           streamController.abort({ kind: 'client_disconnect', source: 'request' } satisfies AbortReason);
         };
@@ -922,7 +966,6 @@ export async function handleMessagesRequest(
           req.removeListener('close', onClientCloseStream);
 
           if (outcome.kind === 'client_disconnect') {
-            options.endpointHealthStore.releaseEndpointProbe(endpoint);
             options.finish(499, 'client disconnected during stream passthrough', {
               source: outcome.source ?? 'request',
               upstreamStatus: upstreamResponse.status,
@@ -930,27 +973,60 @@ export async function handleMessagesRequest(
               chunkCount: outcome.chunkCount,
               totalBytes: outcome.totalBytes,
               streamMode,
-              upstreamName: endpoint.name,
+              upstreamName: selected.name,
             });
             return;
           }
 
           if (outcome.kind === 'completed' || outcome.kind === 'timeout' || outcome.kind === 'error') {
             if (outcome.wroteTextContent) {
-              options.endpointHealthStore.releaseEndpointProbe(endpoint);
+              let postTextFailureReason: string | undefined;
+              if (outcome.kind !== 'completed') {
+                postTextFailureReason = outcome.kind === 'timeout' ? 'stream_timeout_after_text' : 'stream_error_after_text';
+                markFailure(postTextFailureReason, {
+                  status: upstreamResponse.status,
+                  abortReason: streamController.signal.reason,
+                  error: outcome.kind === 'error' ? outcome.error : undefined,
+                });
+                recordFallbackReason(options.stats, postTextFailureReason, selected.name);
+                if (outcome.kind === 'timeout') {
+                  options.stats.upstreamTimeouts += 1;
+                }
+                options.logRequest('stream produced usable text but did not end cleanly', {
+                  upstreamName: selected.name,
+                  upstreamUrl: selected.messagesUrl,
+                  upstreamStatus: upstreamResponse.status,
+                  upstreamContentType: upstreamResponse.headers.get('content-type') ?? '',
+                  streamMode,
+                  failureReason: postTextFailureReason,
+                  outcomeKind: outcome.kind,
+                  phase: outcome.kind === 'timeout' ? outcome.phase : undefined,
+                  chunkCount: outcome.chunkCount,
+                  totalBytes: outcome.totalBytes,
+                  textCharCount: outcome.textCharCount,
+                  error: outcome.kind === 'error'
+                    ? outcome.error instanceof Error
+                      ? { name: outcome.error.name, message: outcome.error.message }
+                      : String(outcome.error)
+                    : undefined,
+                  ...getStreamObservationLogFields(outcome, outcome.kind === 'timeout' ? { phase: outcome.phase } : undefined),
+                });
+              }
               if (outcome.kind === 'completed' && outcome.usage) {
                 addUsageToStats(options.stats, outcome.usage);
               }
-              markEndpointSuccessWithLog(options, endpoint);
+              if (outcome.kind === 'completed') {
+                markSuccess(outcome.usage);
+              }
               if (streamMode === 'normalized') {
                 options.stats.responsesSseNormalized += 1;
               } else {
                 options.stats.responsesSseRaw += 1;
               }
-              if (endpoint.isFallback || i > 0) {
+              if (outcome.kind === 'completed' && (isFallbackAttempt)) {
                 options.logRequest('fallback upstream succeeded', {
-                  fallbackName: endpoint.name,
-                  fallbackUrl: endpoint.url,
+                  fallbackName: selected.name,
+                  fallbackUrl: selected.messagesUrl,
                   upstreamStatus: upstreamResponse.status,
                   upstreamContentType: upstreamResponse.headers.get('content-type') ?? '',
                 });
@@ -963,22 +1039,25 @@ export async function handleMessagesRequest(
             }
           }
 
-          options.endpointHealthStore.releaseEndpointProbe(endpoint);
           if (outcome.kind === 'timeout') {
             options.stats.upstreamTimeouts += 1;
           }
           const reason = outcome.fallbackReason ?? 'stream_no_text_content';
-          markEndpointFailureWithLog(options, endpoint, reason);
-          recordFallbackReason(options.stats, reason, endpoint.name);
+          markFailure(reason, {
+            status: upstreamResponse.status,
+            abortReason: streamController.signal.reason,
+            error: outcome.kind === 'error' ? outcome.error : undefined,
+          });
+          recordFallbackReason(options.stats, reason, selected.name);
 
-          if (outcome.fallbackReason && canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
+          if (outcome.fallbackReason && canRetry()) {
             pendingFallbackReason = reason;
             if (outcome.kind === 'completed') {
                 options.logRequest('stream completed without usable output, falling back', {
-                  upstreamName: endpoint.name,
-                  upstreamUrl: endpoint.url,
+                  upstreamName: selected.name,
+                  upstreamUrl: selected.messagesUrl,
                   fallbackReason: reason,
-                  nextFallbackName: endpoints[i + 1]?.name ?? null,
+                  nextFallbackName: peekNextChannelName(),
                   streamMode,
                   wroteAnyEvent: outcome.wroteAnyEvent,
                   wroteTextContent: outcome.wroteTextContent,
@@ -991,11 +1070,11 @@ export async function handleMessagesRequest(
                 });
               } else if (outcome.kind === 'timeout') {
                 options.logRequest('stream timeout before usable output, falling back', {
-                  upstreamName: endpoint.name,
-                  upstreamUrl: endpoint.url,
+                  upstreamName: selected.name,
+                  upstreamUrl: selected.messagesUrl,
                   phase: outcome.phase,
                   fallbackReason: reason,
-                  nextFallbackName: endpoints[i + 1]?.name ?? null,
+                  nextFallbackName: peekNextChannelName(),
                   streamMode,
                   wroteAnyEvent: outcome.wroteAnyEvent,
                   wroteTextContent: outcome.wroteTextContent,
@@ -1006,10 +1085,10 @@ export async function handleMessagesRequest(
                 });
               } else {
                 options.logRequest('stream read error before usable output, falling back', {
-                  upstreamName: endpoint.name,
-                  upstreamUrl: endpoint.url,
+                  upstreamName: selected.name,
+                  upstreamUrl: selected.messagesUrl,
                   fallbackReason: reason,
-                  nextFallbackName: endpoints[i + 1]?.name ?? null,
+                  nextFallbackName: peekNextChannelName(),
                   streamMode,
                   wroteAnyEvent: outcome.wroteAnyEvent,
                   wroteTextContent: outcome.wroteTextContent,
@@ -1046,18 +1125,16 @@ export async function handleMessagesRequest(
         } catch (error) {
           req.removeListener('close', onClientCloseStream);
           if (res.headersSent || res.writableEnded || res.destroyed) {
-            options.endpointHealthStore.releaseEndpointProbe(endpoint);
-            markEndpointFailureWithLog(options, endpoint, 'proxy_unhandled_error');
-            recordFallbackReason(options.stats, 'proxy_unhandled_error', endpoint.name);
+            markFailure('proxy_unhandled_error');
+            recordFallbackReason(options.stats, 'proxy_unhandled_error', selected.name);
             const taggedError = error instanceof Error ? error : new Error(String(error));
             (taggedError as Error & { afterResponseCommit?: boolean }).afterResponseCommit = true;
             throw taggedError;
           }
-          options.endpointHealthStore.releaseEndpointProbe(endpoint);
-          markEndpointFailureWithLog(options, endpoint, 'unknown_upstream_error');
-          recordFallbackReason(options.stats, 'unknown_upstream_error', endpoint.name);
+          markFailure('unknown_upstream_error', { error, status: upstreamResponse.status });
+          recordFallbackReason(options.stats, 'unknown_upstream_error', selected.name);
 
-          if (canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
+          if (canRetry()) {
             pendingFallbackReason = 'unknown_upstream_error';
             budget.attemptsUsed += 1;
             continue;
@@ -1065,10 +1142,10 @@ export async function handleMessagesRequest(
 
           if (!res.writableEnded && !res.destroyed) {
             options.finish(502, 'stream read error', {
-              upstreamName: endpoint.name,
-              upstreamUrl: endpoint.url,
+              upstreamName: selected.name,
+              upstreamUrl: selected.messagesUrl,
             });
-            sendJson(res, 502, makeAnthropicError('api_error', error instanceof Error ? error.message : String(error)));
+            sendJson(res, 502, makeAnthropicError('api_error', `${error instanceof Error ? error.message : String(error)} (fallback_exhausted)`));
           }
           return;
         }
@@ -1082,8 +1159,8 @@ export async function handleMessagesRequest(
       let sseFallbackReason: AnthropicFallbackReason | null = null;
       let nonStandardProbeTimedOut = false;
       options.logRequest('probing non-standard stream response', {
-        upstreamName: endpoint.name,
-        upstreamUrl: endpoint.url,
+        upstreamName: selected.name,
+        upstreamUrl: selected.messagesUrl,
         upstreamStatus: upstreamResponse.status,
         upstreamContentType,
       });
@@ -1099,29 +1176,21 @@ export async function handleMessagesRequest(
           const synthesized = (await import('./anthropic-sse.js')).synthesizeAnthropicMessageFromEvents(events, requestedModel);
           if (synthesized && isAnthropicMessageWithUsableContent(synthesized)) {
             const synthesizedUsage = (await import('./anthropic-sse.js')).extractAnthropicUsageFromPayload(synthesized, requestedModel) as AnthropicStreamUsage | undefined;
-            options.endpointHealthStore.releaseEndpointProbe(endpoint);
-            if (!synthesizedUsage && canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
-              markEndpointFailureWithLog(options, endpoint, 'stream_missing_usage');
-              recordFallbackReason(options.stats, 'stream_missing_usage', endpoint.name);
-              pendingFallbackReason = 'stream_missing_usage';
-              options.logRequest('upstream json response incomplete, falling back', {
-                fallbackReason: 'stream_missing_usage',
+            if (!synthesizedUsage) {
+              // Usable content is already available; a missing usage block must not trigger another upstream attempt.
+              options.logRequest('usable output without extractable usage; keeping the response', {
                 upstreamContentType,
                 upstreamStatus: upstreamResponse.status,
-                upstreamName: endpoint.name,
+                upstreamName: selected.name,
                 usageFound: false,
-                hasTextOutput: true,
-                nextFallbackName: endpoints[i + 1]?.name ?? null,
               });
-              budget.attemptsUsed += 1;
-              continue;
             }
-            markEndpointSuccessWithLog(options, endpoint);
+            markSuccess(synthesizedUsage);
             options.stats.responsesJson += 1;
-            if (endpoint.isFallback || i > 0) {
+            if (isFallbackAttempt) {
               options.logRequest('fallback upstream succeeded', {
-                fallbackName: endpoint.name,
-                fallbackUrl: endpoint.url,
+                fallbackName: selected.name,
+                fallbackUrl: selected.messagesUrl,
                 upstreamStatus: upstreamResponse.status,
                 upstreamContentType: upstreamContentType,
               });
@@ -1141,13 +1210,12 @@ export async function handleMessagesRequest(
         const abortReason = getAbortReasonFromUnknown(streamController.signal.reason)
           ?? getAbortReasonFromUnknown(error)
           ?? ({ kind: 'timeout', phase: 'first-byte' } satisfies AbortReason);
-        options.endpointHealthStore.releaseEndpointProbe(endpoint);
         if (abortReason.kind === 'client_disconnect') {
           options.finish(499, 'client disconnected during non-standard stream probe', {
             source: abortReason.source ?? 'request',
             upstreamStatus: upstreamResponse.status,
             upstreamContentType,
-            upstreamName: endpoint.name,
+            upstreamName: selected.name,
           });
           return;
         }
@@ -1159,36 +1227,39 @@ export async function handleMessagesRequest(
         if (sseFallbackReason === 'headers_only_timeout') {
           options.stats.upstreamTimeouts += 1;
         }
-        markEndpointFailureWithLog(options, endpoint, sseFallbackReason);
-        recordFallbackReason(options.stats, sseFallbackReason, endpoint.name);
+        markFailure(sseFallbackReason, {
+          status: upstreamResponse.status,
+          abortReason: streamController.signal.reason,
+          error,
+        });
+        recordFallbackReason(options.stats, sseFallbackReason, selected.name);
         sseFallbackFailureRecorded = true;
         options.logRequest(sseFallbackReason === 'headers_only_timeout' ? 'non-standard stream probe timed out before meaningful output, falling back' : 'non-standard stream read error before usable output, falling back', {
-          upstreamName: endpoint.name,
-          upstreamUrl: endpoint.url,
+          upstreamName: selected.name,
+          upstreamUrl: selected.messagesUrl,
           phase: abortReason.kind === 'timeout' ? abortReason.phase : undefined,
           fallbackReason: sseFallbackReason,
-          nextFallbackName: endpoints[i + 1]?.name ?? null,
+          nextFallbackName: peekNextChannelName(),
         });
       }
 
       let nonStreamSseFallbackReason: AnthropicFallbackReason = 'stream_no_text_content';
       if (!sseFallbackFailureRecorded) {
-        options.endpointHealthStore.releaseEndpointProbe(endpoint);
         nonStreamSseFallbackReason = nonStandardProbeTimedOut ? 'headers_only_timeout' : 'stream_no_text_content';
         if (nonStreamSseFallbackReason === 'headers_only_timeout') {
           options.stats.upstreamTimeouts += 1;
         }
-        markEndpointFailureWithLog(options, endpoint, nonStreamSseFallbackReason);
-        recordFallbackReason(options.stats, nonStreamSseFallbackReason, endpoint.name);
+        markFailure(nonStreamSseFallbackReason, { status: upstreamResponse.status });
+        recordFallbackReason(options.stats, nonStreamSseFallbackReason, selected.name);
         options.logRequest(nonStreamSseFallbackReason === 'headers_only_timeout' ? 'non-standard stream probe timed out before meaningful output, falling back' : 'non-standard stream completed without usable output, falling back', {
-          upstreamName: endpoint.name,
-          upstreamUrl: endpoint.url,
+          upstreamName: selected.name,
+          upstreamUrl: selected.messagesUrl,
           fallbackReason: nonStreamSseFallbackReason,
-          nextFallbackName: endpoints[i + 1]?.name ?? null,
+          nextFallbackName: peekNextChannelName(),
         });
       }
 
-      if (canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
+      if (canRetry()) {
         pendingFallbackReason = sseFallbackFailureRecorded ? sseFallbackReason : nonStreamSseFallbackReason;
         budget.attemptsUsed += 1;
         continue;
@@ -1198,7 +1269,7 @@ export async function handleMessagesRequest(
         upstreamStatus: upstreamResponse.status,
         fallbackReason: sseFallbackFailureRecorded ? sseFallbackReason : nonStreamSseFallbackReason,
       });
-      sendJson(res, 502, makeAnthropicError('api_error', 'Upstream returned SSE for non-stream request with no usable content'));
+      sendJson(res, 502, makeAnthropicError('api_error', 'Upstream returned SSE for non-stream request with no usable content (fallback_exhausted)'));
       return;
     }
 
@@ -1210,12 +1281,11 @@ export async function handleMessagesRequest(
         ?? (error instanceof Error && error.message === 'readTextWithTimeout: first-byte'
           ? ({ kind: 'timeout', phase: 'first-byte' } satisfies AbortReason)
           : undefined);
-      options.endpointHealthStore.releaseEndpointProbe(endpoint);
 
       if (abortReason?.kind === 'client_disconnect') {
         options.finish(499, 'client disconnected while reading upstream body', {
           source: abortReason.source ?? 'request',
-          upstreamName: endpoint.name,
+          upstreamName: selected.name,
           upstreamContentType,
         });
         return;
@@ -1223,16 +1293,16 @@ export async function handleMessagesRequest(
 
       if (abortReason?.kind === 'timeout') {
         options.stats.upstreamTimeouts += 1;
-        markEndpointFailureWithLog(options, endpoint, 'body_timeout');
-        recordFallbackReason(options.stats, 'headers_only_timeout', endpoint.name);
+        markFailure('body_timeout', { abortReason, upstreamResponseObserved: false });
+        recordFallbackReason(options.stats, 'headers_only_timeout', selected.name);
 
-        if (canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
+        if (canRetry()) {
           pendingFallbackReason = 'headers_only_timeout';
           options.logRequest('upstream body timeout, falling back', {
             phase: abortReason.phase,
-            upstreamName: endpoint.name,
+            upstreamName: selected.name,
             upstreamContentType,
-            nextFallbackName: endpoints[i + 1]?.name ?? null,
+            nextFallbackName: peekNextChannelName(),
           });
           budget.attemptsUsed += 1;
           continue;
@@ -1240,21 +1310,21 @@ export async function handleMessagesRequest(
 
         options.finish(504, 'upstream body timeout', {
           phase: abortReason.phase,
-          upstreamName: endpoint.name,
+          upstreamName: selected.name,
           upstreamContentType,
         });
         sendJson(res, 504, makeAnthropicError('api_error', `Upstream body timeout: ${abortReason.phase}`));
         return;
       }
 
-      if (canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
+      if (canRetry()) {
         pendingFallbackReason = 'unknown_upstream_error';
-        markEndpointFailureWithLog(options, endpoint, 'unknown_upstream_error');
-        recordFallbackReason(options.stats, 'unknown_upstream_error', endpoint.name);
+        markFailure('unknown_upstream_error', { error });
+        recordFallbackReason(options.stats, 'unknown_upstream_error', selected.name);
         options.logRequest('unhandled upstream body read error, falling back', {
-          upstreamName: endpoint.name,
+          upstreamName: selected.name,
           upstreamContentType,
-          nextFallbackName: endpoints[i + 1]?.name ?? null,
+          nextFallbackName: peekNextChannelName(),
           error: error instanceof Error ? { name: error.name, message: error.message } : String(error),
         });
         budget.attemptsUsed += 1;
@@ -1262,10 +1332,10 @@ export async function handleMessagesRequest(
       }
 
       options.finish(502, 'unhandled upstream body read error', {
-        upstreamName: endpoint.name,
+        upstreamName: selected.name,
         upstreamContentType,
       });
-      sendJson(res, 502, makeAnthropicError('api_error', error instanceof Error ? error.message : String(error)));
+      sendJson(res, 502, makeAnthropicError('api_error', `${error instanceof Error ? error.message : String(error)} (fallback_exhausted)`));
       return;
     }
 
@@ -1273,24 +1343,23 @@ export async function handleMessagesRequest(
     try {
       payload = JSON.parse(upstreamText);
     } catch {
-      options.endpointHealthStore.releaseEndpointProbe(endpoint);
-      if (canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
+      if (canRetry()) {
         pendingFallbackReason = 'unknown_upstream_error';
-        markEndpointFailureWithLog(options, endpoint, 'unknown_upstream_error');
-        recordFallbackReason(options.stats, 'unknown_upstream_error', endpoint.name);
+        markFailure('unknown_upstream_error', { status: upstreamResponse.status });
+        recordFallbackReason(options.stats, 'unknown_upstream_error', selected.name);
         options.logRequest('upstream invalid json, falling back', {
           upstreamStatus: upstreamResponse.status,
-          upstreamName: endpoint.name,
-          nextFallbackName: endpoints[i + 1]?.name ?? null,
+          upstreamName: selected.name,
+          nextFallbackName: peekNextChannelName(),
         });
         budget.attemptsUsed += 1;
         continue;
       }
       options.finish(502, 'upstream invalid json', {
-        upstreamName: endpoint.name,
-        upstreamUrl: endpoint.url,
+        upstreamName: selected.name,
+        upstreamUrl: selected.messagesUrl,
       });
-      sendJson(res, 502, makeAnthropicError('api_error', 'Upstream messages endpoint returned invalid JSON'));
+      sendJson(res, 502, makeAnthropicError('api_error', 'Upstream messages endpoint returned invalid JSON (fallback_exhausted)'));
       return;
     }
 
@@ -1301,20 +1370,19 @@ export async function handleMessagesRequest(
         compatFallbackPatterns: options.compatFallbackPatterns,
         clientErrorPatterns: options.clientErrorPatterns,
       });
-      options.endpointHealthStore.releaseEndpointProbe(endpoint);
       if (fallbackReason) {
-        markEndpointFailureWithLog(options, endpoint, fallbackReason);
-        recordFallbackReason(options.stats, fallbackReason, endpoint.name);
+        markFailure(fallbackReason, { status: upstreamResponse.status, payload });
+        recordFallbackReason(options.stats, fallbackReason, selected.name);
       }
-      if (fallbackReason && canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
+      if (fallbackReason && canRetry()) {
         pendingFallbackReason = fallbackReason;
         options.logRequest('upstream error matched fallback policy', {
-          upstreamName: endpoint.name,
-          upstreamUrl: endpoint.url,
+          upstreamName: selected.name,
+          upstreamUrl: selected.messagesUrl,
           upstreamStatus: upstreamResponse.status,
           upstreamContentType,
           fallbackReason,
-          nextFallbackName: endpoints[i + 1]?.name ?? null,
+          nextFallbackName: peekNextChannelName(),
         });
         budget.attemptsUsed += 1;
         continue;
@@ -1322,8 +1390,8 @@ export async function handleMessagesRequest(
 
       if (!fallbackReason) {
         options.logRequest('upstream error did not match fallback policy', {
-          upstreamName: endpoint.name,
-          upstreamUrl: endpoint.url,
+          upstreamName: selected.name,
+          upstreamUrl: selected.messagesUrl,
           upstreamStatus: upstreamResponse.status,
           upstreamContentType,
         });
@@ -1337,19 +1405,18 @@ export async function handleMessagesRequest(
     }
 
     if (!isAnthropicMessageWithUsableContent(payload)) {
-      options.endpointHealthStore.releaseEndpointProbe(endpoint);
-      markEndpointFailureWithLog(options, endpoint, 'empty_response');
-      recordFallbackReason(options.stats, 'empty_response', endpoint.name);
-      if (canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
+      markFailure('empty_response', { status: upstreamResponse.status, payload });
+      recordFallbackReason(options.stats, 'empty_response', selected.name);
+      if (canRetry()) {
         pendingFallbackReason = 'empty_response';
         options.logRequest('upstream json response incomplete, falling back', {
           fallbackReason: 'empty_response',
           upstreamContentType,
           upstreamStatus: upstreamResponse.status,
-          upstreamName: endpoint.name,
+          upstreamName: selected.name,
           usageFound: false,
           hasTextOutput: false,
-          nextFallbackName: endpoints[i + 1]?.name ?? null,
+          nextFallbackName: peekNextChannelName(),
         });
         budget.attemptsUsed += 1;
         continue;
@@ -1365,35 +1432,26 @@ export async function handleMessagesRequest(
     }
 
     const jsonUsage = (await import('./anthropic-sse.js')).extractAnthropicUsageFromPayload(payload, requestedModel);
-    if (!jsonUsage && canFallback(budget, i, endpoints, options.maxFallbackAttempts, options.maxFallbackTotalMs)) {
-      options.endpointHealthStore.releaseEndpointProbe(endpoint);
-      markEndpointFailureWithLog(options, endpoint, 'stream_missing_usage');
-      recordFallbackReason(options.stats, 'stream_missing_usage', endpoint.name);
-      pendingFallbackReason = 'stream_missing_usage';
-      options.logRequest('upstream json response incomplete, falling back', {
-        fallbackReason: 'stream_missing_usage',
+    if (!jsonUsage) {
+      // Usable content is already available; a missing usage block must not trigger another upstream attempt.
+      options.logRequest('usable output without extractable usage; keeping the response', {
         upstreamContentType,
         upstreamStatus: upstreamResponse.status,
-        upstreamName: endpoint.name,
+        upstreamName: selected.name,
         usageFound: false,
-        hasTextOutput: true,
-        nextFallbackName: endpoints[i + 1]?.name ?? null,
       });
-      budget.attemptsUsed += 1;
-      continue;
     }
     if (jsonUsage) {
       addUsageToStats(options.stats, jsonUsage as AnthropicStreamUsage);
     }
 
-    options.endpointHealthStore.releaseEndpointProbe(endpoint);
-    markEndpointSuccessWithLog(options, endpoint);
+    markSuccess(jsonUsage as AnthropicStreamUsage | undefined);
     options.stats.responsesJson += 1;
 
-    if (endpoint.isFallback || i > 0) {
+    if (isFallbackAttempt) {
       options.logRequest('fallback upstream succeeded', {
-        fallbackName: endpoint.name,
-        fallbackUrl: endpoint.url,
+        fallbackName: selected.name,
+        fallbackUrl: selected.messagesUrl,
         upstreamStatus: upstreamResponse.status,
         upstreamContentType,
       });
@@ -1408,20 +1466,19 @@ export async function handleMessagesRequest(
       if ((error as Error & { afterResponseCommit?: boolean }).afterResponseCommit) {
         throw error;
       }
-      options.endpointHealthStore.releaseEndpointProbe(endpoint);
-      markEndpointFailureWithLog(options, endpoint, 'proxy_unhandled_error');
-      recordFallbackReason(options.stats, 'proxy_unhandled_error', endpoint.name);
+      markFailure('proxy_unhandled_error');
+      recordFallbackReason(options.stats, 'proxy_unhandled_error', selected.name);
       throw error;
     } finally {
       upstreamAttemptController?.dispose();
-      clearTotalTimer();
+      parentController.dispose();
+      currentAttempt?.finish();
     }
   }
-
-  options.finish(502, 'all upstream endpoints exhausted', {
-    fallbackReason: pendingFallbackReason,
-  });
-  handleSseFallbackExhausted(res);
+  } finally {
+    clearTotalTimer();
+    req.removeListener('close', onRequestClose);
+  }
 }
 
 export async function readTextWithTimeout(response: Response, controller: AbortController, timeoutMs: number): Promise<string> {

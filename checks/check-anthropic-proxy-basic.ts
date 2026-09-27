@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 
 import { createAnthropicProxyServer } from '../src/anthropic-proxy.js';
+import { routingFixture } from './_helpers.js';
 
 async function main() {
   let upstreamRequestBody: unknown;
@@ -49,13 +50,13 @@ async function main() {
 
   const proxy = createAnthropicProxyServer({
     instanceName: 'anthropic-proxy-basic-check',
-    primaryProviderName: 'mock-anthropic',
-    primaryProviderBaseUrl: `http://127.0.0.1:${upstreamAddress.port}`,
-    apiKey: 'upstream-key',
     anthropicVersion: '2023-06-01',
-    defaultModel: 'claude-haiku-4-5',
-    modelMappings: { 'public-claude': 'claude-sonnet-4-5' },
     claudeBillingHeaderMode: 'strip_line',
+    routingConfig: routingFixture({
+      primary: { name: 'mock-anthropic', baseUrl: `http://127.0.0.1:${upstreamAddress.port}`, apiKey: 'upstream-key' },
+      models: ['claude-haiku-4-5', 'claude-sonnet-4-5'],
+      aliases: { 'public-claude': 'claude-sonnet-4-5' },
+    }),
   });
 
   proxy.listen(0, '127.0.0.1');
@@ -67,8 +68,11 @@ async function main() {
   try {
     const healthResponse = await fetch(`${proxyBaseUrl}/healthz?verbose=1`);
     assert.equal(healthResponse.status, 200);
-    const health = await healthResponse.json() as { upstreamMessagesUrl?: string };
-    assert.equal(health.upstreamMessagesUrl, `http://127.0.0.1:${upstreamAddress.port}/v1/messages`);
+    const health = await healthResponse.json() as { channels?: number; models?: number; defaultModel?: string; ok?: boolean };
+    assert.equal(health.ok, true);
+    assert.equal(health.channels, 1, 'healthz reports the configured channel count');
+    assert.equal(health.models, 2, 'healthz reports the configured canonical model count');
+    assert.equal(health.defaultModel, 'claude-haiku-4-5');
 
     const response = await fetch(`${proxyBaseUrl}/v1/messages?beta=true`, {
       method: 'POST',
@@ -100,8 +104,12 @@ async function main() {
 
     const modelsResponse = await fetch(`${proxyBaseUrl}/v1/models?beta=true`);
     assert.equal(modelsResponse.status, 200);
-    const models = await modelsResponse.json() as { data?: Array<{ id?: string }> };
-    assert.equal(models.data?.some(item => item.id === 'public-claude'), true);
+    const models = await modelsResponse.json() as { data?: Array<{ id?: string; type?: string }>; has_more?: boolean; first_id?: string | null; last_id?: string | null };
+    assert.deepEqual(models.data?.map(item => item.id), ['claude-haiku-4-5', 'claude-sonnet-4-5', 'public-claude'], 'canonical models and aliases are listed locally');
+    assert.equal(models.data?.every(item => item.type === 'model'), true);
+    assert.equal(models.has_more, false);
+    assert.equal(models.first_id, 'claude-haiku-4-5');
+    assert.equal(models.last_id, 'public-claude');
 
     console.log('Anthropic proxy basic check passed.');
   } finally {

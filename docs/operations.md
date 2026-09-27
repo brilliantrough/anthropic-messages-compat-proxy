@@ -1,426 +1,341 @@
 # Operations
 
-Deployment, process management, and operational procedures for the Responses API Compatibility Proxy.
+Deployment, process management, and operational procedures for the Anthropic Messages Compatibility Proxy.
 
-Before pushing this repository to a public remote, review `docs/publishing-checklist.md`.
-
----
+Before publishing this repository, review `docs/publishing-checklist.md`.
 
 ## Table of Contents
 
 - [Multi-Instance Layout](#multi-instance-layout)
 - [Do Not Commit Real Instance Directories](#do-not-commit-real-instance-directories)
 - [Build and Run Commands](#build-and-run-commands)
-- [Development Command](#development-command)
-- [Health and Admin Endpoints](#health-and-admin-endpoints)
+- [Active Routes](#active-routes)
 - [Local Admin UI](#local-admin-ui)
-- [Logs and Captures — Ignored Directories](#logs-and-captures--ignored-directories)
+- [Routing, Breakers, and Quota](#routing-breakers-and-quota)
+- [Usage and Uptime](#usage-and-uptime)
+- [Logs and Captures](#logs-and-captures)
 - [Docker Deployment](#docker-deployment)
 - [Safe Restart Pattern](#safe-restart-pattern)
 - [Systemd Template](#systemd-template)
 - [Migration from Local Working Directory](#migration-from-local-working-directory)
 
----
-
 ## Multi-Instance Layout
 
-Each proxy instance is configured by a dedicated directory under `instances/`. The directory name conventionally matches the instance name and encodes the port for easy identification:
+Each runtime instance has its own directory under `instances/`. The directory usually includes the port in its name so operators can match files, services, and health checks quickly.
 
-```
+```text
 instances/
-  example-11234/        ← shipped example template
+  example-11234/
     .env.example
     fallback.json.example
-    model-map.json.example
-  example-11235/        ← shipped example template
-    .env.example
-    fallback.json.example
-    model-map.json.example
-  proxy-11234/          ← runtime instance (gitignored)
+  proxy-11234/
     .env
     fallback.json
-    model-map.json
-  proxy-11235/          ← runtime instance (gitignored)
-    .env
-    fallback.json
-    model-map.json
+    usage.sqlite
 ```
 
-To add a new instance:
+Create a new instance from a tracked example directory:
 
-1. Copy an example directory:
-   ```bash
-   cp -r instances/example-11234 instances/proxy-NEWPORT
-   ```
-2. Edit `instances/proxy-NEWPORT/.env` — set `PORT`, `INSTANCE_NAME`, provider credentials, `PROXY_ENV_PATH`, and file paths.
-3. Edit `instances/proxy-NEWPORT/fallback.json` and `model-map.json` as needed.
-4. Start the instance using the systemd template or `npm run proxy:start`.
+```bash
+cp -r instances/example-11234 instances/proxy-NEWPORT
+cp instances/proxy-NEWPORT/.env.example instances/proxy-NEWPORT/.env
+cp instances/proxy-NEWPORT/fallback.json.example instances/proxy-NEWPORT/fallback.json
+chmod 600 instances/proxy-NEWPORT/fallback.json
+```
 
----
+Edit `instances/proxy-NEWPORT/.env` and set `PORT`, `HOST`, `INSTANCE_NAME`, `PROXY_ENV_PATH`, and `FALLBACK_CONFIG_PATH`.
+
+Then edit `fallback.json` and fill in `channels`, `models`, `aliases`, and `default_model`. Channels hold the base URL and API key that were previously split between `.env` and a provider JSON file.
+
+Every channel is addressed at `<base_url>/v1/messages` and `<base_url>/v1/models`, with trailing slashes removed from `base_url`.
 
 ## Do Not Commit Real Instance Directories
 
-The `.gitignore` excludes `instances/proxy-*/` so that real instance directories containing secrets and local runtime paths are never committed. Only the `example-*` template directories are tracked.
+Real instance directories are ignored by git because they can contain secrets, local paths, provider names, logs, captures, and usage history.
 
-**Never commit:**
+Never commit `instances/proxy-*`, real `.env` files, live `fallback.json`, `usage.sqlite`, `logs/`, `captures/`, or generated debug output.
 
-- `instances/proxy-*` directories.
-- Real `.env` files.
-- `config.json` or real `fallback.json` / `model-map.json` files with live credentials.
-- `logs/`, `captures/`, or `sse-failures/` directories.
-- Debug capture output.
-
----
+Tracked `example-*` directories are public-safe templates. Copy them before adding provider keys.
 
 ## Build and Run Commands
 
 | Command | Purpose |
 | --- | --- |
-| `npm run build` | Compile TypeScript source to `dist/`. |
-| `npm run proxy:start` | Run the compiled proxy from `dist/json-proxy.js`. Uses environment variables for configuration. |
-| `npm run proxy` | Run the proxy through `tsx` without a separate compile step (convenience alias). |
+| `npm run build` | Compile TypeScript into `dist/`. |
+| `npm run proxy:start` | Run `node dist/anthropic-proxy.js`. |
+| `npm run proxy` | Run `src/anthropic-proxy.ts` through `tsx`. |
+| `npm run proxy:dev` | Same development entrypoint as `npm run proxy`. |
 
-Production deployments normally run `npm run build` first, then `npm run proxy:start`. The `run.sh` wrapper script handles those two steps against the current shell environment, but it does not load an instance `.env` file for you.
-
-For a single local instance, you can also load an instance `.env` file explicitly:
+Production runs should build first, then start the compiled entrypoint.
 
 ```bash
-env $(grep -v '^#' instances/proxy-11234/.env | xargs) npm run proxy:start
+npm run build
+node --env-file=instances/proxy-11234/.env dist/anthropic-proxy.js
 ```
 
----
+`run.sh` runs `npm run build` and then execs `npm run proxy:start`. It does not load `instances/<instance-name>/.env` for you.
 
-## Development Command
+The deployed services in this repository run the compiled entrypoint through the systemd template below. A development instance started with `npm run proxy:dev` runs the TypeScript source through `tsx` instead, so a source edit is picked up on the next process start without a build step.
 
-| Command | Purpose |
-| --- | --- |
-| `npm run proxy:dev` | Start the proxy via `tsx` for live development. |
+Use systemd or Docker when you want the instance environment loaded by the process manager.
 
-This skips the explicit build step and runs the TypeScript source directly.
-
----
-
-## Health and Admin Endpoints
+## Active Routes
 
 ### GET /healthz
 
-Returns a JSON object with instance status, configuration summary, and the current `activeRequests` count. The response includes more configuration fields than this abbreviated example; use it as an operator-facing snapshot, not as a strict schema.
+Returns a runtime status snapshot. It includes instance identity, the loaded routing config path, channel and canonical model counts, the default model, Anthropic header defaults, the health window and attempt policy, `activeRequests`, and whether usage history is available.
 
-```json
-{
-  "ok": true,
-  "instanceName": "proxy-11234",
-  "activeRequests": 3,
-  "maxConcurrentRequests": 128,
-  "cachedResponses": 12,
-  "port": 11234,
-  "host": "0.0.0.0"
-}
-```
-
-### GET /admin/stats
-
-Returns detailed runtime statistics including per-endpoint health, fallback counts, usage aggregates, and all proxy counters. The object is intended for diagnostics and may grow as additional counters are added.
-
-```json
-{
-  "instanceName": "proxy-11234",
-  "activeRequests": 3,
-  "stats": {
-    "requestsTotal": 1500,
-    "responsesJson": 200,
-    "responsesSseNormalized": 1280,
-    "responsesSseRaw": 15,
-    "upstreamTimeouts": 5,
-    "fallbackReasons": {
-      "upstream5xx": 0,
-      "headersOnlyTimeout": 1,
-      "streamMissingUsage": 0
-    },
-    "usageResponses": 1400,
-    "usageInputTokens": 250000,
-    "usageOutputTokens": 80000
-  },
-  "endpointHealth": [
-    {
-      "name": "primary-provider",
-      "state": "closed",
-      "failureCount": 0,
-      "successCount": 120
-    }
-  ]
-}
-```
-
-### POST /admin/cache/clear
-
-Clears the in-memory response cache. Returns the number of entries removed.
-
-```json
-{
-  "ok": true,
-  "clearedResponses": 12,
-  "cachedResponses": 0
-}
+```bash
+curl -s http://127.0.0.1:11234/healthz
 ```
 
 ### GET /v1/models
 
-Proxies the upstream `/v1/models` endpoint, applying model alias mappings.
+Proxies the upstream model list through the highest-priority available channel of the requested model route. Alias entries are exposed when their canonical target appears upstream.
 
-### GET /v1/responses/:id
+```bash
+curl -s http://127.0.0.1:11234/v1/models \
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01'
+```
 
-Looks up a previously cached response by ID. Returns `404` if not found.
+### POST /v1/messages
 
-### POST /v1/responses
+Accepts Anthropic Messages JSON requests and streaming requests. The proxy forwards Anthropic-shaped payloads upstream with header normalization, canonical model routing, per-channel retry, ordered fallback, and stream handling.
 
-Main proxy endpoint. Accepts OpenAI Responses API requests and forwards to the configured upstream provider with normalization, fallback, and streaming support.
+```bash
+curl -s http://127.0.0.1:11234/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"claude-latest","max_tokens":128,"messages":[{"role":"user","content":"Reply with exactly OK."}]}'
+```
 
-**Warning:** These admin endpoints are intended for local or trusted-network operation. Do not expose them to the public internet without authentication and authorization.
+An alias resolves to its canonical model before the request goes upstream, and the response echoes the model string the client sent. For streaming clients, set `stream: true` in the body and use `curl -N` or another SSE-capable client.
 
----
+### /admin/*
+
+Admin routes serve the config UI, monitor UI, usage history, config API, stats API, reload flow, and rollback flow. They are localhost-only unless `PROXY_ADMIN_ALLOW_HOST=1` is set.
+
+Do not expose `/admin/*` directly to the public internet. Use an SSH tunnel, localhost-bound Docker port, or an authenticated local reverse proxy.
 
 ## Local Admin UI
 
-The proxy includes a browser-based admin UI for inspecting and editing configuration at runtime. Access it at:
+Open the config UI on the proxy host:
 
-```
+```text
 http://127.0.0.1:<PORT>/admin
 ```
 
-### Localhost-Only Constraint
+The UI shows five views — Channels, Models, Aliases, Environment, and Runtime — plus the monitor and usage pages. It marks unsaved drafts before they are applied, and a draft survives view switches until it is saved or discarded.
 
-By default, all `/admin` endpoints (including the UI and API) are restricted to localhost connections (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`). Remote connections receive `403 Forbidden`.
+### Validate
 
-If `PROXY_ADMIN_ALLOW_HOST=1` is enabled, non-localhost requests are accepted too. The bundled Docker compose path uses this together with a `127.0.0.1` host port binding so the host browser can reach `/admin` without publishing it more broadly. If you need wider access, prefer an SSH tunnel or a local reverse proxy with authentication. Do not expose `/admin` directly to the public internet.
+Validate checks the current draft through `POST /admin/config/validate`. It reports field errors and warnings without writing files.
 
-### UI Sections
+### Save
 
-The admin UI renders five sections:
+Save sends `PUT /admin/config`. The server creates a `.bak` file, writes `fallback.json`, and reloads the runtime snapshot from disk.
 
-1. **Overview** — Runtime version, restart-required fields, instance name, and port.
-2. **Providers** — Primary provider environment fields (editable) and fallback provider table with name, base URL, API key mode, and configuration status.
-3. **Model Mappings** — Editable key-value rows for model alias-to-target mappings. Use the "+ Add Mapping" button to add new rows.
-4. **Runtime / Compatibility** — Read-only display of common runtime environment values (PORT, HOST, stream mode, timeouts, cache settings, etc.).
-5. **Review & Apply** — Action buttons: Validate, Save, Reload, Rollback.
+Secret fields stay unchanged when the draft uses `apiKeyAction: "keep"` or `secretAction: "keep"`. Only explicit replacement values change stored secrets.
 
-### Draft State and Dirty Indicator
+The admin writer serializes `fallback.json` and `.env`. It does not preserve comments, quotes, or multiline formatting in `.env`, and it refuses to save a draft that still carries a deprecated key.
 
-Edits in the UI are tracked as a local draft. When the draft differs from the server configuration, an "Unsaved changes" badge appears. Refreshing the page discards the draft and reloads the current server configuration.
+### Reload
 
-### Workflow
+Reload calls `POST /admin/config/reload`. It rereads the current `fallback.json` and `.env` from disk without saving the browser draft.
 
-#### Validate
+Use reload after editing instance files outside the UI.
 
-Click **Validate** to check the current draft without saving. The UI calls `POST /admin/config/validate` and displays validation results (valid or error list). No files are modified.
+### Rollback
 
-#### Save
+Rollback calls `POST /admin/config/rollback`. It restores the last `.bak` files for `.env` and `fallback.json`, then reloads runtime config.
 
-Click **Save** to apply the draft:
+If no `.bak` files exist, rollback returns success with an empty restored list.
 
-1. The UI calls `PUT /admin/config` with the draft payload.
-2. The server creates `.bak` backup files, writes the new configuration, and triggers a runtime reload.
-3. On success, the UI reloads the configuration from the server.
-4. If the reload detects `PORT` or `HOST` changes, a restart-required notice is displayed.
+### Restart-Required Fields
 
-Secret fields that were not changed use `secretAction: "keep"` to preserve existing values. Only secrets with explicit new values are replaced.
+Runtime reload applies channel, canonical model, alias, timeout, logging, and policy changes without restarting.
 
-#### Reload
+Changes to `HOST` or `PORT` are reported in `restartRequiredFields`. They take effect only after the process restarts.
 
-Click **Reload** to re-read configuration files from disk without saving UI changes. The UI calls `POST /admin/config/reload`. This is useful when config files have been edited manually outside the UI.
+### Monitor
 
-#### Rollback
+Open the monitor on the proxy host:
 
-Click **Rollback** to restore the `.bak` files created by the last save:
-
-1. The UI calls `POST /admin/config/rollback`.
-2. The server restores `.bak` files and triggers a reload.
-3. On success, the UI reloads the configuration from the server.
-
-If no `.bak` files exist, rollback succeeds with an empty restored list.
-
-### Provider Monitor
-
-Open the live provider monitor on the proxy host:
-
-```
+```text
 http://127.0.0.1:<PORT>/admin/monitor
 ```
 
-The monitor shows global proxy counters, provider circuit-breaker state, cooldown remaining, failure/success counts, recent failure reason, and a lightweight in-browser active-request trend.
+The monitor reads `GET /admin/monitor/stats` once per second while visible. Polling is quiet and does not add one log line per refresh.
 
-The monitor polls `GET /admin/monitor/stats` once per second while the browser tab is visible. Under the default admin policy this endpoint is localhost-only; if `PROXY_ADMIN_ALLOW_HOST=1` is enabled, the same trusted-host warning applies here too. It is intentionally quiet and does not write one log line per poll. Samples are kept only in browser memory for lightweight one-minute trends.
+It shows global counters, the routing overview with every model route and its channel priority, per-channel and per-model health windows, quota cooldowns, manual breaker state, and a lightweight active-request trend kept in browser memory.
 
-### Restart-Required Notice
+Each channel row has immediate breaker controls: `Trip now` opens a manual block with the default cooldown, and `Restore` clears every block and failure window for that channel. A restore also discards a late in-flight result so it cannot overwrite the new state.
 
-When the runtime reload detects that `PORT` or `HOST` has changed (fields listed in `restartRequiredFields`), the admin UI shows a prominent restart-required notice. These changes take effect only after a full process restart (e.g., `systemctl restart`).
+`GET /admin/stats` returns the same operator data as JSON for diagnostics and scripts.
 
-### Error Handling
+### Usage
 
-API errors are displayed in the UI with a red notice. Common error scenarios:
+Open the usage page on the proxy host:
 
-- **Save fails**: Config saved to disk but runtime reload failed. The proxy continues using the prior configuration.
-- **Rollback with no backups**: Returns success with an informational message; no files are restored.
-- **Invalid draft**: Validation lists specific field-level errors.
-- **Network/server errors**: Displayed with the error message from the API response.
+```text
+http://127.0.0.1:<PORT>/admin/usage
+```
 
----
+It reads `GET /admin/usage/stats` for the selected range plus `GET /admin/uptime` for the availability band. Each real upstream attempt is one row, including fallback failures; admin calls, health checks, locally rejected requests, and cached-response reads are never counted.
 
-## Logs and Captures — Ignored Directories
+## Routing, Breakers, and Quota
 
-The `.gitignore` excludes these runtime directories:
+Health is tracked per channel for the ordinary Messages route, and per channel plus model for each model window. One real upstream attempt counts once at completion, its start time and channel are recorded with the canonical model, and a successful attempt does not clear the window.
 
-| Directory | Contents | Risk |
-| --- | --- | --- |
-| `logs/` | Request logs. | May contain prompt fragments. |
-| `captures/` | Debug captures from SSE failures and missing-usage diagnostics. | Contains full prompts and upstream responses. |
-| `sse-failures/` | Raw upstream SSE text for failed reconstruction. | Contains full prompts and upstream responses. |
-| `dist/` | Compiled output. | Rebuildable; no secrets expected. |
+A channel opens its automatic breaker only when both conditions hold inside the rolling window: failures reach `PROXY_HEALTH_FAILURE_THRESHOLD` and the failure rate is strictly above `PROXY_HEALTH_FAILURE_RATE_THRESHOLD`. The breaker stays open for `PROXY_HEALTH_COOLDOWN_MS`. There is no half-open probe budget: after the cooldown the channel starts collecting a fresh window, and only statistics collected after recovery decide the next block.
 
-Debug captures are disabled by default. When enabled during incident investigation, disable them immediately afterward and delete captured files. These directories can contain full prompts, provider responses, and other sensitive operational data.
+`disable_cooldown` exempts a channel from the automatic breaker only. Quota exhaustion and manual control still apply to it.
 
-Relevant environment variables:
+Quota exhaustion is isolated from the request as well: the remaining attempts for that request are skipped, the channel is parked until `min(now + PROXY_QUOTA_COOLDOWN_MS, next 00:02 Beijing time)`, and a late success cannot clear it.
+
+When every candidate route is already blocked and no upstream request has started, the proxy answers `503 model_channels_unavailable` with `Retry-After`. When at least one attempt started and every available route failed, the response keeps the `fallback_exhausted` semantics.
+
+Reload validates the whole document before it swaps the runtime snapshot, health settings, and topology, keeps state whose fingerprint still matches, and ignores leases issued under the previous topology.
+
+To take a channel out of rotation on purpose, use the manual breaker in the monitor instead of editing its API key or deleting it from a route. The manual block survives reloads, is visible in the uptime history, and can be lifted with one click.
+
+## Usage and Uptime
+
+`usage.sqlite` in the instance directory stores attempt history and uptime samples. The server samples uptime every 180 seconds on the UTC boundary, keeps thirty days, and reads local state only — sampling never calls upstream.
+
+Anthropic accounting keeps the three reported input components separate and derives the inclusive input as `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`. A component the upstream did not report stays `NULL` rather than becoming `0`, and the coverage counters show how many rows reported complete data.
+
+Back up an instance by copying its runtime directory, including `.env`, `fallback.json`, and `usage.sqlite`. Keep backups outside git and protect them like secrets.
+
+```bash
+mkdir -p backups
+tar -czf backups/proxy-11234-config.tgz instances/proxy-11234
+```
+
+Delete or move `usage.sqlite` only while the process is stopped. A pending row becomes `interrupted` on the next start, so an unclean shutdown does not invent a successful request.
+
+## Logs and Captures
+
+Runtime logs go to stdout and stderr unless your process manager redirects them. Use `journalctl` for systemd and `docker compose logs` for Docker.
+
+Debug capture settings are off by default. Enable them only during incident work, then disable them and delete captured files.
 
 ```env
+PROXY_LOG_REQUEST_BODY=0
 PROXY_DEBUG_SSE=0
 PROXY_SSE_FAILURE_DEBUG=0
-PROXY_SSE_FAILURE_DIR=captures/proxy-11234/sse-failures
+PROXY_SSE_FAILURE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/sse-failures
 PROXY_STREAM_MISSING_USAGE_DEBUG=0
-PROXY_STREAM_MISSING_USAGE_DIR=captures/proxy-11234/stream/missing-usage
+PROXY_STREAM_MISSING_USAGE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/stream/missing-usage
 PROXY_STREAM_MODE=normalized
 ```
 
----
+Capture files can contain prompts, tool input, provider errors, and upstream responses. Treat them as sensitive operational data. Logs record channel ids, canonical models, attempt outcomes, and fallback reasons; they never print API keys.
 
 ## Docker Deployment
 
-Docker is the simplest public deployment path for this project. It does not require systemd inside the container because the container runs the proxy directly as its single foreground process.
+Docker runs the proxy as one foreground process with `node dist/anthropic-proxy.js`.
 
-### Prepare a Runtime Instance Directory
-
-Reuse the same runtime instance layout used by the non-Docker path:
+Prepare the local runtime instance first:
 
 ```bash
 cp -r instances/example-11234 instances/proxy-11234
 cp instances/proxy-11234/.env.example instances/proxy-11234/.env
 cp instances/proxy-11234/fallback.json.example instances/proxy-11234/fallback.json
-cp instances/proxy-11234/model-map.json.example instances/proxy-11234/model-map.json
+chmod 600 instances/proxy-11234/fallback.json
 ```
 
-Edit `instances/proxy-11234/.env` and fill:
+Fill `instances/proxy-11234/.env` with listener values and local file paths:
 
 ```env
-PRIMARY_PROVIDER_NAME=primary-provider
-PRIMARY_PROVIDER_BASE_URL=https://provider.example
-PRIMARY_PROVIDER_API_KEY=your_api_key_here
+ANTHROPIC_VERSION=2023-06-01
 PROXY_ENV_PATH=./instances/proxy-11234/.env
 FALLBACK_CONFIG_PATH=./instances/proxy-11234/fallback.json
-MODEL_MAP_PATH=./instances/proxy-11234/model-map.json
 ```
 
-The tracked `fallback.json.example` is empty on purpose. Add fallback providers only when you actually want multi-provider failover.
+Channel base URLs and API keys belong in `fallback.json`, not in `.env`.
 
-### Start Docker Compose
+Start compose:
 
 ```bash
 docker compose up --build
 ```
 
-The provided `docker-compose.yaml`:
+The compose file loads `./instances/proxy-11234/.env`, mounts `./instances/proxy-11234` at `/app/instances/proxy-11234`, binds `127.0.0.1:11234:11234`, and sets `PROXY_ADMIN_ALLOW_HOST=1`.
 
-- builds the local `Dockerfile`,
-- loads env values from `./instances/proxy-11234/.env`,
-- mounts `./instances/proxy-11234` into the container at `/app/instances/proxy-11234`,
-- publishes `127.0.0.1:11234:11234`,
-- sets `PROXY_ADMIN_ALLOW_HOST=1` so the host can reach `/admin` through the mapped port.
+The localhost bind keeps `/admin/*` available from the host without publishing it broadly. Add stronger protection if you change the bind address.
 
-If `11234` is already in use on the host, edit the host side of the `ports:` mapping in `docker-compose.yaml`.
+Host URLs after startup:
 
-### Access from the Host
+```text
+http://127.0.0.1:11234/v1/messages
+http://127.0.0.1:11234/v1/models
+http://127.0.0.1:11234/admin
+http://127.0.0.1:11234/admin/monitor
+http://127.0.0.1:11234/admin/usage
+```
 
-After startup:
-
-- API: `http://127.0.0.1:11234/v1/responses`
-- Config UI: `http://127.0.0.1:11234/admin`
-- Provider monitor: `http://127.0.0.1:11234/admin/monitor`
-
-### Logs and Lifecycle
-
-Use Docker rather than systemd commands:
+Use Docker lifecycle commands for logs and shutdown:
 
 ```bash
 docker compose logs -f
 docker compose down
 ```
 
-### Editing Mounted Config
-
-The admin UI writes to the mounted runtime files. Changes made through `/admin` persist back to the host files under `instances/proxy-11234/` because that directory is mounted read-write.
-
-### Admin Access Safety
-
-`PROXY_ADMIN_ALLOW_HOST=1` is intended only for Docker-style host access through the published port. It should remain an explicit opt-in.
-
-The provided compose file binds the service to `127.0.0.1`, which keeps `/admin` reachable only from the host machine. If you change the port binding to `0.0.0.0` or publish it more broadly, you are also exposing admin access more broadly and should add additional protections.
-
----
+Admin UI writes persist to the host because the instance directory is mounted read-write. Usage history lands in the same mounted directory.
 
 ## Safe Restart Pattern
 
-To restart a proxy instance without dropping in-flight requests, use the `wait-proxy-idle.sh` script. It polls the `/healthz` endpoint and returns only when `activeRequests` reaches zero (or the service is already stopped).
-
-### Usage
+Use `wait-proxy-idle.sh` before restarting a user-level systemd instance. It polls `/healthz` until `activeRequests` is zero or the service is already stopped.
 
 ```bash
-# Wait for a specific instance by name and port
-./wait-proxy-idle.sh proxy-NEWPORT NEWPORT
-
-# Then restart the service
-systemctl --user restart responses-proxy@proxy-NEWPORT
+./wait-proxy-idle.sh proxy-11234 11234
+systemctl --user restart anthropic-messages-proxy@proxy-11234.service
 ```
 
-### How it works
+The script defaults to `anthropic-messages-proxy@<instance-name>` for `WAIT_PROXY_IDLE_SERVICE` and derives the port from the instance name suffix when possible.
 
-1. Checks whether the systemd service is active. If not, exits immediately (safe to proceed).
-2. Polls `http://127.0.0.1:PORT/healthz` at a configurable interval (default 0.5s).
-3. Extracts `activeRequests` from the JSON response using a lightweight Node.js inline parser.
-4. When `activeRequests === 0`, exits with success — the service can be safely restarted.
-5. If the service stops while waiting, exits immediately (safe to proceed).
-
-### Environment overrides
+Useful overrides:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `WAIT_PROXY_IDLE_PORT` | Extracted from instance name suffix | Override the health check port. |
+| `WAIT_PROXY_IDLE_PORT` | derived from instance name, else `11236` | Override the health port. |
 | `WAIT_PROXY_IDLE_INTERVAL` | `0.5` | Seconds between polls. |
-| `WAIT_PROXY_IDLE_SERVICE` | `responses-proxy@<INSTANCE_NAME>` | systemd service name. |
-| `WAIT_PROXY_IDLE_STATUS_URL` | `http://127.0.0.1:<PORT>/healthz` | Health endpoint URL. |
+| `WAIT_PROXY_IDLE_SERVICE` | `anthropic-messages-proxy@<instance-name>` | Override the systemd unit. |
+| `WAIT_PROXY_IDLE_STATUS_URL` | `http://127.0.0.1:<PORT>/healthz` | Override the health URL. |
 
-### Integration with systemd
+One-line restart:
 
 ```bash
-# One-liner safe restart
-./wait-proxy-idle.sh proxy-NEWPORT NEWPORT && systemctl --user restart responses-proxy@proxy-NEWPORT
+./wait-proxy-idle.sh proxy-11234 11234 && systemctl --user restart anthropic-messages-proxy@proxy-11234.service
 ```
 
----
+For system-level services, use the same wait command with a matching `WAIT_PROXY_IDLE_SERVICE`, then call `sudo systemctl restart`.
 
 ## Systemd Template
 
-A systemd service template is provided at `deploy/systemd/responses-proxy@.service.example`.
+The tracked template is `deploy/systemd/anthropic-messages-proxy@.service.example`.
 
-### Template contents
+It uses this deployment path:
+
+```text
+/opt/anthropic-messages-compat-proxy
+```
+
+Template contents:
 
 ```ini
 [Unit]
-Description=Responses API Compatibility Proxy (%i)
+Description=Anthropic Messages Compatibility Proxy (%i)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/responses-api-compat-proxy
-EnvironmentFile=/opt/responses-api-compat-proxy/instances/%i/.env
+WorkingDirectory=/opt/anthropic-messages-compat-proxy
+EnvironmentFile=/opt/anthropic-messages-compat-proxy/instances/%i/.env
 ExecStart=/usr/bin/env npm run proxy:start
 Restart=on-failure
 RestartSec=5
@@ -430,86 +345,71 @@ TimeoutStopSec=120
 WantedBy=default.target
 ```
 
-### Installation
+Install a user-level service:
 
-1. Copy the template to the appropriate systemd directory:
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/anthropic-messages-proxy@.service.example ~/.config/systemd/user/anthropic-messages-proxy@.service
+systemctl --user daemon-reload
+systemctl --user enable --now anthropic-messages-proxy@proxy-11234.service
+```
 
-   For a **user-level** service:
-   ```bash
-   mkdir -p ~/.config/systemd/user
-   cp deploy/systemd/responses-proxy@.service.example ~/.config/systemd/user/responses-proxy@.service
-   ```
+Install a system-level service:
 
-   For a **system-level** service:
-   ```bash
-   sudo cp deploy/systemd/responses-proxy@.service.example /etc/systemd/system/responses-proxy@.service
-   ```
+```bash
+sudo cp deploy/systemd/anthropic-messages-proxy@.service.example /etc/systemd/system/anthropic-messages-proxy@.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now anthropic-messages-proxy@proxy-11234.service
+```
 
-2. Adjust `WorkingDirectory` and `EnvironmentFile` paths to match your deployment location.
-3. Adjust `WantedBy` based on your installation mode:
-   - User services: `WantedBy=default.target`
-   - System services: `WantedBy=multi-user.target`
-4. Enable and start the instance:
-   ```bash
-   # User service
-   systemctl --user daemon-reload
-   systemctl --user enable --now responses-proxy@proxy-NEWPORT
+For system services, change `WantedBy=multi-user.target` if your host policy expects that target.
 
-   # System service
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now responses-proxy@proxy-NEWPORT
-   ```
+`%i` becomes the instance directory name. `anthropic-messages-proxy@proxy-11234.service` loads `/opt/anthropic-messages-compat-proxy/instances/proxy-11234/.env`.
 
-**Note:** The provided systemd example is a template. Operators should adapt `WorkingDirectory`, `EnvironmentFile`, `WantedBy`, instance naming, and installation mode (user vs system services) to match their deployment environment. Do not commit local systemd unit names, private hostnames, or deployment-specific absolute paths back into the repository.
+`EnvironmentFile` is what loads the instance env for systemd. `run.sh` does not do that when called directly.
 
-### Instance parameter
+Keep local unit edits, hostnames, private paths, and service names out of git.
 
-The `%i` in the service name is replaced by the instance directory name. For example, `responses-proxy@proxy-11234` loads its environment from `instances/proxy-11234/.env`.
-
-### TimeoutStopSec
-
-The default `TimeoutStopSec=120` gives in-flight streaming requests up to two minutes to complete during a stop or restart. Adjust this value based on your `PROXY_TOTAL_REQUEST_TIMEOUT_MS` setting. If `PROXY_TOTAL_REQUEST_TIMEOUT_MS` is larger than `TimeoutStopSec`, systemd may force termination before the proxy's own total timeout expires.
-
----
+`TimeoutStopSec=120` gives in-flight streams two minutes to finish during stop or restart. Align it with `PROXY_TOTAL_REQUEST_TIMEOUT_MS` so systemd does not kill the process too early.
 
 ## Migration from Local Working Directory
 
-If the proxy was initially run from a local working directory (e.g., a home directory checkout) and is being migrated to a deployment path:
+Build in the target deployment path:
 
-1. **Build at the target location:**
-   ```bash
-   cd /opt/responses-api-compat-proxy
-   npm install --omit=dev
-   npm run build
-   ```
+```bash
+cd /opt/anthropic-messages-compat-proxy
+npm ci
+npm run build
+npm prune --omit=dev
+```
 
-2. **Copy instance configurations:**
-   ```bash
-   mkdir -p instances/proxy-NEWPORT
-   cp /path/to/old/instances/proxy-NEWPORT/.env instances/proxy-NEWPORT/.env
-   cp /path/to/old/instances/proxy-NEWPORT/fallback.json instances/proxy-NEWPORT/fallback.json
-   cp /path/to/old/instances/proxy-NEWPORT/model-map.json instances/proxy-NEWPORT/model-map.json
-   ```
+Copy instance files into the target path:
 
-3. **Update file paths in `.env`:**
-    Ensure `FALLBACK_CONFIG_PATH`, `MODEL_MAP_PATH`, and any debug directory paths reference the new location:
-    ```env
-    PROXY_ENV_PATH=./instances/proxy-NEWPORT/.env
-    FALLBACK_CONFIG_PATH=./instances/proxy-NEWPORT/fallback.json
-    MODEL_MAP_PATH=./instances/proxy-NEWPORT/model-map.json
-    PROXY_SSE_FAILURE_DIR=captures/proxy-NEWPORT/sse-failures
-    PROXY_STREAM_MISSING_USAGE_DIR=captures/proxy-NEWPORT/stream/missing-usage
-    ```
+```bash
+mkdir -p instances/proxy-11234
+cp /path/to/old/instances/proxy-11234/.env instances/proxy-11234/.env
+cp /path/to/old/instances/proxy-11234/fallback.json instances/proxy-11234/fallback.json
+chmod 600 instances/proxy-11234/fallback.json
+```
 
-4. **Install and start the systemd service** using the template (see above).
+Update file paths in the copied `.env`:
 
-5. **Verify the migration:**
-    ```bash
-    curl -s http://127.0.0.1:NEWPORT/healthz
-    curl -s http://127.0.0.1:NEWPORT/admin/stats
-    curl -s http://127.0.0.1:NEWPORT/admin/monitor/stats
-    ```
+```env
+PROXY_ENV_PATH=./instances/proxy-11234/.env
+FALLBACK_CONFIG_PATH=./instances/proxy-11234/fallback.json
+PROXY_SSE_FAILURE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/sse-failures
+PROXY_STREAM_MISSING_USAGE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/stream/missing-usage
+```
 
-6. **Stop the old process** once the new instance is confirmed healthy.
+Install and start `anthropic-messages-proxy@proxy-11234.service` with the systemd template.
 
-7. **Clean up the old working directory** — remove any real instance directories, `.env` files, logs, and captures from the old location to avoid stale configuration or data exposure.
+Verify the migrated instance:
+
+```bash
+curl -s http://127.0.0.1:11234/healthz
+curl -s http://127.0.0.1:11234/v1/models
+curl -s http://127.0.0.1:11234/admin/stats
+curl -s http://127.0.0.1:11234/admin/monitor/stats
+```
+
+After the new instance is healthy, stop the old process. Remove old real instance directories, `.env` files, logs, and captures from the previous working directory.

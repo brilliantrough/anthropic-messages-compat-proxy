@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { getAvailablePort } from './_helpers.js';
+import { getAvailablePort, instanceEnvPath, writeRoutingConfig } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -25,6 +27,7 @@ async function waitForHealthy(url: string) {
 }
 
 async function main() {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'anthropic-proxy-logging-'));
   const upstream = createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/messages') {
       const chunks: Buffer[] = [];
@@ -94,6 +97,12 @@ async function main() {
   assert.ok(upstreamAddress && typeof upstreamAddress !== 'string');
 
   const proxyPort = await getAvailablePort();
+  const routingConfigPath = await writeRoutingConfig(tempDir, {
+    primary: { name: 'mock-anthropic', baseUrl: `http://127.0.0.1:${upstreamAddress.port}`, apiKey: 'test-key' },
+    models: ['claude-sonnet-4-5'],
+    aliases: { 'public-claude': 'claude-sonnet-4-5' },
+  });
+
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
     cwd: workspaceRoot,
@@ -102,9 +111,8 @@ async function main() {
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
       INSTANCE_NAME: 'anthropic-proxy-logging-check',
-      PRIMARY_PROVIDER_NAME: 'mock-anthropic',
-      PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${upstreamAddress.port}`,
-      PRIMARY_PROVIDER_API_KEY: 'test-key',
+      PROXY_ENV_PATH: instanceEnvPath(tempDir),
+      FALLBACK_CONFIG_PATH: routingConfigPath,
       PROXY_LOG_REQUEST_BODY: '1',
       PROXY_DEBUG_SSE: '1',
     },
@@ -176,7 +184,7 @@ async function main() {
 
     const stdoutText = stdout.join('');
     assert.match(stdoutText, /Instance: anthropic-proxy-logging-check/, 'expected startup instance log');
-    assert.match(stdoutText, /Primary provider: mock-anthropic/, 'expected startup provider log');
+    assert.match(stdoutText, /Channels: 1, canonical models: 1, aliases: 1/, 'expected startup routing summary log');
     assert.match(stdoutText, /Request body logging: enabled/, 'expected startup request-body logging status');
     assert.match(stdoutText, /SSE debug logging: enabled/, 'expected startup sse debug status');
     assert.match(stdoutText, /request accepted/, 'expected request accepted log');

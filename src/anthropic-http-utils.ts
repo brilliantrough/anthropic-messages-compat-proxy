@@ -1,6 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { isJsonRecord, type JsonRecord, type JsonValue } from './responses-input-normalization.js';
-import type { UpstreamEndpoint } from './anthropic-config.js';
 
 export function normalizeBaseUrl(baseUrl: string) {
   return baseUrl.replace(/\/+$/, '');
@@ -148,6 +147,3 @@ export async function readJsonBody(req: IncomingMessage) {
   return JSON.parse(raw) as JsonRecord;
 }
 
-export function getModelsUrlFromEndpoint(endpoint: UpstreamEndpoint) {
-  return endpoint.url.replace(/\/v1\/messages$/, '/v1/models');
-}

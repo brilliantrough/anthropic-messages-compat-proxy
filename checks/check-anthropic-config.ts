@@ -1,292 +1,191 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import {
-  createAnthropicRuntimeConfig,
-  type AnthropicRuntimeConfig,
-  type UpstreamEndpoint,
-} from '../src/anthropic-config.js';
+import { createAnthropicRuntimeConfig, routingPolicyDefaults } from '../src/anthropic-config.js';
+import { parseRoutingConfig } from '../src/routing-config.js';
 
-const allTempDirs: string[] = [];
+const routingDoc = {
+  default_model: 'claude-opus-4-8',
+  channels: [
+    { id: 'primary', name: 'Primary', base_url: 'https://primary.example.com/', api_key: 'primary-key-123' },
+    { id: 'fallback-a', name: 'Fallback A', base_url: 'https://fallback.example.com', api_key: 'fb-key-123', disable_cooldown: true },
+  ],
+  models: {
+    'claude-opus-4-8': { channel_ids: ['primary', 'fallback-a'] },
+    'claude-sonnet-4-6': { channel_ids: ['fallback-a'] },
+  },
+  aliases: { 'claude-latest': 'claude-opus-4-8' },
+};
 
-function makeTempDir() {
-  const dir = mkdtempSync(path.join(os.tmpdir(), 'anthropic-config-'));
-  allTempDirs.push(dir);
-  return dir;
-}
-
-function writeDotEnv(dir: string, lines: string[]) {
+async function writeInstance(dir: string, envLines: string) {
   const envPath = path.join(dir, '.env');
-  const fallbackPath = path.join(dir, 'fallback.json');
-  const modelMapPath = path.join(dir, 'model-map.json');
-  const full = [
-    ...lines,
-    `FALLBACK_CONFIG_PATH=${fallbackPath}`,
-    `MODEL_MAP_PATH=${modelMapPath}`,
-  ].join('\n');
-  writeFileSync(envPath, full, 'utf8');
+  // Relative routing paths resolve against the process working directory, so tests use absolute paths.
+  await writeFile(envPath, envLines.trimStart().replaceAll('./fallback.json', path.join(dir, 'fallback.json')), 'utf8');
+  await writeFile(path.join(dir, 'fallback.json'), JSON.stringify(routingDoc, null, 2), 'utf8');
+  return envPath;
 }
 
-function writeFallbackJson(dir: string, content: unknown) {
-  writeFileSync(path.join(dir, 'fallback.json'), JSON.stringify(content, null, 2), 'utf8');
-}
+async function main() {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'anthropic-config-check-'));
 
-function writeModelMapJson(dir: string, content: unknown) {
-  writeFileSync(path.join(dir, 'model-map.json'), JSON.stringify(content, null, 2), 'utf8');
-}
-
-function main() {
   try {
-    // === 1. Host/port parsing ===
-    console.log('=== 1. Host/port parsing ===');
+    console.log('=== 1. Env and routing config basics ===');
     {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-        'PORT=9123',
-        'HOST=127.0.0.1',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.host, '127.0.0.1', 'host from HOST env');
-      assert.equal(config.port, 9123, 'port from PORT env');
+      const dir = path.join(tempRoot, 'basic');
+      await rm(dir, { recursive: true, force: true });
+      await mkdirFor(dir);
+      const envPath = await writeInstance(dir, `
+HOST=127.0.0.1
+PORT=9123
+INSTANCE_NAME=test-instance
+FALLBACK_CONFIG_PATH=./fallback.json
+`);
+      const config = createAnthropicRuntimeConfig(envPath);
+      assert.equal(config.host, '127.0.0.1');
+      assert.equal(config.port, 9123);
+      assert.equal(config.instanceName, 'test-instance');
+      assert.equal(config.routingConfigPath, path.join(dir, 'fallback.json'));
+      assert.equal(config.routingConfig.defaultModel, 'claude-opus-4-8');
+      assert.equal(config.routingConfig.aliases['claude-latest'], 'claude-opus-4-8');
+      assert.equal(config.routingConfig.channelsById.get('primary')?.messagesUrl, 'https://primary.example.com/v1/messages');
+      assert.equal(config.routingConfig.channelsById.get('fallback-a')?.disableCooldown, true);
+      assert.equal(config.routingConfig.modelRoutes.get('claude-sonnet-4-6')?.channelIds.length, 1);
+      assert.equal(config.usageDbPath, path.join(dir, 'usage.sqlite'), 'the usage database lives beside the instance env');
+      assert.equal(config.adminAllowHost, false, 'remote admin calls are rejected by default');
     }
 
-    // === 2. Default host/port ===
-    console.log('=== 2. Default host/port ===');
+    console.log('=== 2. Policy defaults and overrides ===');
     {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.host, '0.0.0.0', 'default host');
-      assert.equal(config.port, 11234, 'default port');
+      const dir = path.join(tempRoot, 'policy');
+      await mkdirFor(dir);
+      const envPath = await writeInstance(dir, `
+PORT=11234
+FALLBACK_CONFIG_PATH=./fallback.json
+`);
+      const defaults = createAnthropicRuntimeConfig(envPath);
+      assert.equal(defaults.healthWindowMs, Number(routingPolicyDefaults.PROXY_HEALTH_WINDOW_MS));
+      assert.equal(defaults.healthFailureThreshold, Number(routingPolicyDefaults.PROXY_HEALTH_FAILURE_THRESHOLD));
+      assert.equal(defaults.healthFailureRateThreshold, Number(routingPolicyDefaults.PROXY_HEALTH_FAILURE_RATE_THRESHOLD));
+      assert.equal(defaults.healthCooldownMs, Number(routingPolicyDefaults.PROXY_HEALTH_COOLDOWN_MS));
+      assert.equal(defaults.channelMaxAttempts, Number(routingPolicyDefaults.PROXY_CHANNEL_MAX_ATTEMPTS));
+      assert.equal(defaults.channelRetryDelayMs, Number(routingPolicyDefaults.PROXY_CHANNEL_RETRY_DELAY_MS));
+      assert.equal(defaults.quotaCooldownMs, Number(routingPolicyDefaults.PROXY_QUOTA_COOLDOWN_MS));
+      assert.equal(defaults.channelMaxAttempts, 3);
+      assert.equal(defaults.channelRetryDelayMs, 500);
+      assert.equal(defaults.healthWindowMs, 180000);
+      assert.equal(defaults.healthCooldownMs, 600000);
+      assert.equal(defaults.quotaCooldownMs, 7200000);
+      assert.equal(defaults.adminAllowHost, false, 'remote admin access stays disabled unless PROXY_ADMIN_ALLOW_HOST is set');
+    }
+    {
+      const dir = path.join(tempRoot, 'policy-override');
+      await mkdirFor(dir);
+      const envPath = await writeInstance(dir, `
+PORT=11234
+FALLBACK_CONFIG_PATH=./fallback.json
+PROXY_HEALTH_WINDOW_MS=60000
+PROXY_HEALTH_FAILURE_THRESHOLD=5
+PROXY_HEALTH_FAILURE_RATE_THRESHOLD=0.25
+PROXY_HEALTH_COOLDOWN_MS=120000
+PROXY_CHANNEL_MAX_ATTEMPTS=2
+PROXY_CHANNEL_RETRY_DELAY_MS=250
+PROXY_QUOTA_COOLDOWN_MS=3600000
+PROXY_ADMIN_ALLOW_HOST=1
+PROXY_INSTANCE_DIR=/tmp/does-not-exist
+`);
+      const config = createAnthropicRuntimeConfig(envPath);
+      assert.equal(config.healthWindowMs, 60000);
+      assert.equal(config.healthFailureThreshold, 5);
+      assert.equal(config.healthFailureRateThreshold, 0.25);
+      assert.equal(config.healthCooldownMs, 120000);
+      assert.equal(config.channelMaxAttempts, 2);
+      assert.equal(config.channelRetryDelayMs, 250);
+      assert.equal(config.quotaCooldownMs, 3600000);
+      assert.equal(config.adminAllowHost, true);
+      assert.equal(config.usageDbPath, path.join(dir, 'usage.sqlite'), 'PROXY_INSTANCE_DIR must not move the usage database');
     }
 
-    // === 3. upstreamMessagesUrl = <base>/v1/messages ===
-    console.log('=== 3. upstreamMessagesUrl ===');
-    {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-        'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.com',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.upstreamMessagesUrl, 'https://api.anthropic.com/v1/messages');
+    console.log('=== 3. Invalid policy values are rejected ===');
+    for (const [key, value] of [['PROXY_CHANNEL_MAX_ATTEMPTS', '0'], ['PROXY_CHANNEL_RETRY_DELAY_MS', '-5'], ['PROXY_HEALTH_FAILURE_THRESHOLD', 'abc'], ['PROXY_HEALTH_FAILURE_RATE_THRESHOLD', '2']]) {
+      const dir = path.join(tempRoot, `invalid-${key}`);
+      await mkdirFor(dir);
+      const envPath = await writeInstance(dir, `
+PORT=11234
+FALLBACK_CONFIG_PATH=./fallback.json
+${key}=${value}
+`);
+      assert.throws(() => createAnthropicRuntimeConfig(envPath), new RegExp(key), `${key}=${value} must be rejected`);
     }
 
-    // === 4. upstreamModelsUrl = <base>/v1/models ===
-    console.log('=== 4. upstreamModelsUrl ===');
+    console.log('=== 4. Missing routing config fails fast ===');
     {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-        'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.com/',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.upstreamModelsUrl, 'https://api.anthropic.com/v1/models');
-      assert.equal(config.primaryProviderBaseUrl, 'https://api.anthropic.com', 'trailing slash stripped');
+      const dir = path.join(tempRoot, 'missing');
+      await mkdirFor(dir);
+      const envPath = path.join(dir, '.env');
+      await writeFile(envPath, 'PORT=11234\n', 'utf8');
+      assert.throws(() => createAnthropicRuntimeConfig(envPath), /ENOENT|no such file/u);
     }
 
-    // === 5. anthropicVersion and anthropicBeta parsing ===
-    console.log('=== 5. anthropicVersion and anthropicBeta ===');
+    console.log('=== 5. Legacy keys are warned about, not silently used ===');
     {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-        'ANTHROPIC_VERSION=2023-06-01',
-        'ANTHROPIC_BETA=max-tokens-3-5-sonnet-2024-07-15,interleaved-thinking-2025-05-14',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.anthropicVersion, '2023-06-01');
-      assert.equal(config.anthropicBeta, 'max-tokens-3-5-sonnet-2024-07-15,interleaved-thinking-2025-05-14');
-    }
-
-    // === 6. anthropicBeta absent ===
-    console.log('=== 6. anthropicBeta absent ===');
-    {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.anthropicBeta, undefined, 'anthropicBeta undefined when not set');
-    }
-
-    // === 7. model mapping load from model-map.json ===
-    console.log('=== 7. Model mapping load ===');
-    {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, {
-        model_mappings: {
-          'claude-3': 'claude-sonnet-4-5',
-          'sonnet': 'claude-sonnet-4-5',
-        },
-      });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.deepEqual(config.modelMappings, {
-        'claude-3': 'claude-sonnet-4-5',
-        'sonnet': 'claude-sonnet-4-5',
-      });
-    }
-
-    // === 8. fallback endpoint load from fallback.json using api_key_env ===
-    console.log('=== 8. Fallback endpoint load with api_key_env ===');
-    {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, {
-        fallback_api_config: [
-          {
-            name: 'fallback-a',
-            base_url: 'https://fallback.example.com',
-            api_key_env: 'FALLBACK_KEY_A',
-            disable_cooldown: true,
-          },
-        ],
-      });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-        'FALLBACK_KEY_A=fb-key-123',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.fallbackEndpoints.length, 1);
-      assert.equal(config.fallbackEndpoints[0].name, 'fallback-a');
-      assert.equal(config.fallbackEndpoints[0].url, 'https://fallback.example.com/v1/messages');
-      assert.equal(config.fallbackEndpoints[0].apiKey, 'fb-key-123');
-      assert.equal(config.fallbackEndpoints[0].isFallback, true);
-      assert.equal(config.fallbackEndpoints[0].disableCooldown, true);
-    }
-
-    // === 9. fallback with inline api_key ===
-    console.log('=== 9. Fallback with inline api_key ===');
-    {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, {
-        fallback_api_config: [
-          {
-            name: 'fallback-inline',
-            base_url: 'https://inline.example.com',
-            api_key: 'inline-key-456',
-          },
-        ],
-      });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.fallbackEndpoints.length, 1);
-      assert.equal(config.fallbackEndpoints[0].apiKey, 'inline-key-456');
-    }
-
-    // === 10. primaryEndpoint constructed correctly ===
-    console.log('=== 10. primaryEndpoint ===');
-    {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=pk-abc',
-        'PRIMARY_PROVIDER_NAME=primary',
-        'PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.com',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.primaryEndpoint.name, 'primary');
-      assert.equal(config.primaryEndpoint.url, 'https://api.anthropic.com/v1/messages');
-      assert.equal(config.primaryEndpoint.apiKey, 'pk-abc');
-      assert.equal(config.primaryEndpoint.isFallback, false);
-    }
-
-    // === 11. claudeBillingHeaderMode parsing ===
-    console.log('=== 11. claudeBillingHeaderMode ===');
-    {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-        'PROXY_CLAUDE_BILLING_HEADER_MODE=strip-cch',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.claudeBillingHeaderMode, 'strip_cch');
-    }
-
-    // === 12. default claudeBillingHeaderMode ===
-    console.log('=== 12. default claudeBillingHeaderMode ===');
-    {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=test-key',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.claudeBillingHeaderMode, 'strip_line');
-    }
-
-    // === 13. Missing PRIMARY_PROVIDER_API_KEY throws ===
-    console.log('=== 13. Missing API key throws ===');
-    {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, { fallback_api_config: [] });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, []);
-      let thrown = false;
+      const dir = path.join(tempRoot, 'legacy');
+      await mkdirFor(dir);
+      const envPath = await writeInstance(dir, `
+PORT=11234
+FALLBACK_CONFIG_PATH=./fallback.json
+PRIMARY_PROVIDER_BASE_URL=https://legacy.example.com
+PRIMARY_PROVIDER_API_KEY=legacy-key
+MODEL_MAP_PATH=./model-map.json
+PROXY_ENDPOINT_FAILURE_THRESHOLD=1
+PROXY_MAX_FALLBACK_ATTEMPTS=11
+`);
+      const warnings: string[] = [];
+      const originalWarn = console.warn;
+      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
       try {
-        createAnthropicRuntimeConfig(dir);
-      } catch (err) {
-        thrown = true;
-        assert.ok(err instanceof Error);
-        assert.ok(err.message.includes('PRIMARY_PROVIDER_API_KEY'));
+        const config = createAnthropicRuntimeConfig(envPath);
+        assert.equal(config.routingConfig.channelsById.size, 2, 'channels still come from the routing config only');
+        assert.equal(config.channelMaxAttempts, 3, 'PROXY_MAX_FALLBACK_ATTEMPTS must not drive the new attempt policy');
+      } finally {
+        console.warn = originalWarn;
       }
-      assert.ok(thrown, 'should throw on missing API key');
+      const joined = warnings.join('\n');
+      assert.match(joined, /PRIMARY_PROVIDER_\*/u);
+      assert.match(joined, /MODEL_MAP_PATH is ignored/u);
+      assert.match(joined, /Legacy endpoint health settings ignored/u);
     }
 
-    // === 14. allEndpoints includes primary + fallbacks ===
-    console.log('=== 14. allEndpoints ===');
+    console.log('=== 6. Routing document validation covers the allowlist boundary ===');
     {
-      const dir = makeTempDir();
-      writeFallbackJson(dir, {
-        fallback_api_config: [
-          { name: 'fb-1', base_url: 'https://fb1.example.com', api_key: 'k1' },
-        ],
-      });
-      writeModelMapJson(dir, { model_mappings: {} });
-      writeDotEnv(dir, [
-        'PRIMARY_PROVIDER_API_KEY=pk',
-        'PRIMARY_PROVIDER_BASE_URL=https://primary.example.com',
-      ]);
-      const config = createAnthropicRuntimeConfig(dir);
-      assert.equal(config.allEndpoints.length, 2);
-      assert.equal(config.allEndpoints[0].name, 'primary-provider');
-      assert.equal(config.allEndpoints[1].name, 'fb-1');
+      assert.throws(() => parseRoutingConfig({ ...routingDoc, models: {} }, '<x>'), /at least one canonical model/u);
+      assert.throws(() => parseRoutingConfig({ ...routingDoc, channels: [] }, '<x>'), /channels must be a non-empty array/u);
+      const parsed = parseRoutingConfig(routingDoc, '<x>');
+      const primaryFingerprint = parsed.channelsById.get('primary')!.fingerprint;
+      assert.match(primaryFingerprint, /^[0-9a-f]{64}$/u, 'the fingerprint is a hash, never the raw credential');
+      assert.equal(primaryFingerprint.includes('primary-key-123'), false, 'the API key is never echoed in the fingerprint');
+      assert.equal(parseRoutingConfig(routingDoc, '<x>').channelsById.get('primary')!.fingerprint, primaryFingerprint, 'the fingerprint is stable for identical settings');
+      const rotated = parseRoutingConfig({ ...routingDoc, channels: [{ ...routingDoc.channels[0], api_key: 'rotated-key' }, routingDoc.channels[1]] }, '<x>');
+      assert.notEqual(rotated.channelsById.get('primary')!.fingerprint, primaryFingerprint, 'key rotation changes the fingerprint');
+      const renamed = parseRoutingConfig({ ...routingDoc, channels: [{ ...routingDoc.channels[0], name: 'Renamed' }, routingDoc.channels[1]] }, '<x>');
+      assert.equal(renamed.channelsById.get('primary')!.fingerprint, primaryFingerprint, 'a display-name rename keeps the health state (the fingerprint covers id, URL and key)');
+      const moved = parseRoutingConfig({ ...routingDoc, channels: [{ ...routingDoc.channels[0], base_url: 'https://other.example.com' }, routingDoc.channels[1]] }, '<x>');
+      assert.notEqual(moved.channelsById.get('primary')!.fingerprint, primaryFingerprint, 'a URL change rotates the fingerprint');
     }
 
-    console.log('\nAll anthropic-config checks passed.');
+    console.log('Anthropic config check passed.');
   } finally {
-    for (const d of allTempDirs) {
-      try { rmSync(d, { recursive: true, force: true }); } catch {}
-    }
+    await rm(tempRoot, { recursive: true, force: true });
   }
 }
 
-main();
+async function mkdirFor(dir: string) {
+  const { mkdir } = await import('node:fs/promises');
+  await mkdir(dir, { recursive: true });
+}
+
+main().catch(error => {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exitCode = 1;
+});

@@ -8,7 +8,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { getAvailablePort } from './_helpers.js';
+import { getAvailablePort, instanceEnvPath, writeRoutingConfig } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -127,6 +127,11 @@ async function main() {
     'utf8',
   );
 
+  const routingConfigPath = await writeRoutingConfig(tempDir, {
+    primary: { name: 'empty-primary', baseUrl: `http://127.0.0.1:${primaryAddress.port}`, apiKey: 'primary-key' },
+    legacyFallbackPath: fallbackConfigPath,
+  });
+
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
     cwd: workspaceRoot,
@@ -135,10 +140,10 @@ async function main() {
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
       INSTANCE_NAME: 'anthropic-proxy-stream-fallback-check',
-      PRIMARY_PROVIDER_NAME: 'empty-primary',
-      PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
-      PRIMARY_PROVIDER_API_KEY: 'primary-key',
-      FALLBACK_CONFIG_PATH: fallbackConfigPath,
+
+      PROXY_ENV_PATH: instanceEnvPath(tempDir),
+      PROXY_CHANNEL_MAX_ATTEMPTS: '1',
+      FALLBACK_CONFIG_PATH: routingConfigPath,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

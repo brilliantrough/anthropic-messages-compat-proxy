@@ -1,11 +1,9 @@
 import 'dotenv/config';
-import { bootstrapHttpProxySupport } from './http-proxy-bootstrap.js';
 import { createServer } from 'node:http';
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-import { isJsonRecord, type ClaudeBillingHeaderMode, type JsonRecord, type JsonValue } from './responses-input-normalization.js';
+import type { ClaudeBillingHeaderMode, JsonValue } from './responses-input-normalization.js';
 import {
   handleMessagesRequest,
   createProxyStats,
@@ -14,17 +12,21 @@ import {
   type AnthropicMessagesHandlerOptions,
 } from './anthropic-messages-handler.js';
 import { handleModelsRequest } from './anthropic-models-handler.js';
-import { type UpstreamEndpoint, type StreamMode, type AnthropicRuntimeConfig, loadFallbackEndpoints } from './anthropic-config.js';
+import { type StreamMode, type AnthropicRuntimeConfig } from './anthropic-config.js';
+import type { RoutingConfig } from './routing-config.js';
 import { createAdminHandler } from './admin-api.js';
 import { createConfigFileStoreFromPaths } from './config-files.js';
-import { createRuntimeConfigStore, type RuntimeConfigStore, type RuntimeSnapshot } from './runtime-config.js';
-import { createEndpointHealthStore, type EndpointHealthStore } from './proxy-core.js';
+import { buildHealthTopology, createRuntimeConfigStore, type RuntimeConfigStore, type RuntimeSnapshot } from './runtime-config.js';
+import { createHealthRegistry, type HealthRegistry, type HealthRegistryOptions } from './channel-health.js';
+import { routingAttemptStats } from './upstream-router.js';
+import { createUsageStore } from './usage-store.js';
+import { createUsageContext, type UsageContext } from './usage-tracking.js';
+import { collectUptime, startUptimeSampling, UPTIME_INTERVAL_MS } from './uptime.js';
+import { bootstrapHttpProxySupport } from './http-proxy-bootstrap.js';
 import {
   normalizeBaseUrl,
   sendJson,
   makeAnthropicError,
-  getOutboundHeaders,
-  applyModelMappingsToModelsPayload,
   readJsonBody,
 } from './anthropic-http-utils.js';
 import { createRequestId, logRequest } from './anthropic-logging.js';
@@ -40,10 +42,13 @@ const DEFAULT_TIMEOUTS = {
   totalRequestTimeoutMs: 600000,
   maxConcurrentRequests: 128,
   maxFallbackTotalMs: 30000,
+  channelMaxAttempts: 3,
+  channelRetryDelayMs: 500,
 } as const;
 
 const _requestContext = new AsyncLocalStorage<RuntimeSnapshot<AnthropicRuntimeConfig>>();
 let _runtimeStore: RuntimeConfigStore<AnthropicRuntimeConfig> | null = null;
+let _initialSnapshot: RuntimeSnapshot<AnthropicRuntimeConfig>;
 
 function getConfig(): AnthropicRuntimeConfig {
   const snap = _requestContext.getStore();
@@ -57,28 +62,21 @@ function getLatestSnapshot(): RuntimeSnapshot<AnthropicRuntimeConfig> {
   return _initialSnapshot;
 }
 
-let _initialSnapshot: RuntimeSnapshot<AnthropicRuntimeConfig>;
-
 export type AnthropicProxyConfig = {
   port: number;
   host?: string;
   instanceName?: string;
-  primaryProviderName: string;
-  primaryProviderBaseUrl: string;
-  apiKey: string;
+  routingConfig: RoutingConfig;
   anthropicVersion?: string;
   anthropicBeta?: string;
-  defaultModel?: string;
-  modelMappings?: Record<string, string>;
   claudeBillingHeaderMode?: ClaudeBillingHeaderMode;
-  primaryEndpoint?: UpstreamEndpoint;
-  fallbackEndpoints?: UpstreamEndpoint[];
-  endpointTimeoutCooldownMs?: number;
-  endpointInvalidResponseCooldownMs?: number;
-  endpointAuthCooldownMs?: number;
-  endpointFailureThreshold?: number;
-  endpointHalfOpenMaxProbes?: number;
-  maxFallbackAttempts?: number;
+  healthWindowMs?: number;
+  healthFailureThreshold?: number;
+  healthFailureRateThreshold?: number;
+  healthCooldownMs?: number;
+  quotaCooldownMs?: number;
+  channelMaxAttempts?: number;
+  channelRetryDelayMs?: number;
   maxFallbackTotalMs?: number;
   upstreamTimeoutMs?: number;
   nonStreamingRequestTimeoutMs?: number;
@@ -99,32 +97,27 @@ export type AnthropicProxyConfig = {
   compatFallbackPatterns?: string[];
   clientErrorPatterns?: string[];
   adminHandler?: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<boolean>;
-  endpointHealthStore?: EndpointHealthStore;
+  healthRegistry?: HealthRegistry;
+  usageStore?: ReturnType<typeof createUsageStore>;
   stats?: ProxyStats;
 };
 
 export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
-  const baseUrl = normalizeBaseUrl(config.primaryProviderBaseUrl);
-  const upstreamMessagesUrl = `${baseUrl}/v1/messages`;
-  const upstreamModelsUrl = `${baseUrl}/v1/models`;
   const instanceName = config.instanceName ?? 'anthropic-proxy';
-
-  const primaryEndpoint = config.primaryEndpoint ?? {
-    name: config.primaryProviderName,
-    url: upstreamMessagesUrl,
-    apiKey: config.apiKey,
-    isFallback: false,
+  const healthRegistryOptions: HealthRegistryOptions = {
+    healthWindowMs: config.healthWindowMs,
+    healthFailureThreshold: config.healthFailureThreshold,
+    healthFailureRateThreshold: config.healthFailureRateThreshold,
+    healthCooldownMs: config.healthCooldownMs,
+    quotaCooldownMs: config.quotaCooldownMs,
   };
-  const fallbackEndpoints = config.fallbackEndpoints ?? [];
-  const endpointHealthStore = config.endpointHealthStore ?? createEndpointHealthStore({
-    endpointTimeoutCooldownMs: config.endpointTimeoutCooldownMs ?? 120000,
-    endpointInvalidResponseCooldownMs: config.endpointInvalidResponseCooldownMs ?? 120000,
-    endpointAuthCooldownMs: config.endpointAuthCooldownMs ?? 1800000,
-    endpointFailureThreshold: config.endpointFailureThreshold ?? 1,
-    endpointHalfOpenMaxProbes: config.endpointHalfOpenMaxProbes ?? 1,
-  });
+  const healthRegistry = config.healthRegistry ?? createHealthRegistry(healthRegistryOptions);
+  // Both the CLI store and this factory use the same topology rule, so checks cannot diverge from production.
+  healthRegistry.reconcile(buildHealthTopology(config.routingConfig));
   const stats = config.stats ?? createProxyStats();
   const maxConcurrentRequests = config.maxConcurrentRequests ?? DEFAULT_TIMEOUTS.maxConcurrentRequests;
+  const usageContext: UsageContext = createUsageContext();
+  const usageStore = config.usageStore;
 
   _initialSnapshot = {
     runtimeVersion: 0,
@@ -132,47 +125,39 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
       host: config.host ?? '0.0.0.0',
       port: config.port,
       instanceName,
-      primaryProviderName: config.primaryProviderName,
-      primaryProviderBaseUrl: baseUrl,
-      apiKey: config.apiKey,
-      upstreamMessagesUrl,
-      upstreamModelsUrl,
+      adminAllowHost: false,
+      routingConfigPath: config.routingConfig.path,
+      routingConfig: config.routingConfig,
       anthropicVersion: config.anthropicVersion ?? '2023-06-01',
       anthropicBeta: config.anthropicBeta,
-      defaultModel: config.defaultModel ?? 'claude-sonnet-4-5',
-      modelMappings: config.modelMappings ?? {},
       claudeBillingHeaderMode: config.claudeBillingHeaderMode ?? 'strip_line',
-      primaryEndpoint,
-      fallbackEndpoints,
-      allEndpoints: [primaryEndpoint, ...fallbackEndpoints],
-      adminAllowHost: false,
-      endpointTimeoutCooldownMs: config.endpointTimeoutCooldownMs ?? 120000,
-      endpointInvalidResponseCooldownMs: config.endpointInvalidResponseCooldownMs ?? 120000,
-      endpointAuthCooldownMs: config.endpointAuthCooldownMs ?? 1800000,
-      endpointFailureThreshold: config.endpointFailureThreshold ?? 1,
-      endpointHalfOpenMaxProbes: config.endpointHalfOpenMaxProbes ?? 1,
-      maxFallbackAttempts: config.maxFallbackAttempts ?? Math.max(1, fallbackEndpoints.length),
+      healthWindowMs: config.healthWindowMs ?? 180000,
+      healthFailureThreshold: config.healthFailureThreshold ?? 15,
+      healthFailureRateThreshold: config.healthFailureRateThreshold ?? 0.5,
+      healthCooldownMs: config.healthCooldownMs ?? 600000,
+      channelMaxAttempts: config.channelMaxAttempts ?? DEFAULT_TIMEOUTS.channelMaxAttempts,
+      channelRetryDelayMs: config.channelRetryDelayMs ?? DEFAULT_TIMEOUTS.channelRetryDelayMs,
+      quotaCooldownMs: config.quotaCooldownMs ?? 7200000,
       maxFallbackTotalMs: config.maxFallbackTotalMs ?? DEFAULT_TIMEOUTS.maxFallbackTotalMs,
-      fallbackConfigPath: '',
-      modelMappingPath: '',
       upstreamTimeoutMs: config.upstreamTimeoutMs ?? DEFAULT_TIMEOUTS.upstreamTimeoutMs,
       nonStreamingRequestTimeoutMs: config.nonStreamingRequestTimeoutMs ?? DEFAULT_TIMEOUTS.nonStreamingRequestTimeoutMs,
       firstByteTimeoutMs: config.firstByteTimeoutMs ?? DEFAULT_TIMEOUTS.firstByteTimeoutMs,
       firstTextTimeoutMs: config.firstTextTimeoutMs ?? DEFAULT_TIMEOUTS.firstTextTimeoutMs,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? DEFAULT_TIMEOUTS.streamIdleTimeoutMs,
-       totalRequestTimeoutMs: config.totalRequestTimeoutMs ?? DEFAULT_TIMEOUTS.totalRequestTimeoutMs,
-       maxConcurrentRequests,
-       defaultStreamMode: config.defaultStreamMode ?? 'normalized',
-       logRequestBodies: config.logRequestBodies ?? false,
-       debugSse: config.debugSse ?? false,
-       sseFailureDebugEnabled: config.sseFailureDebugEnabled ?? false,
-       sseFailureDebugDir: config.sseFailureDebugDir ?? resolve('captures', instanceName, 'sse-failures'),
-       streamMissingUsageDebugEnabled: config.streamMissingUsageDebugEnabled ?? false,
-       streamMissingUsageDebugDir: config.streamMissingUsageDebugDir ?? resolve('captures', instanceName, 'stream', 'missing-usage'),
-       fallbackOnRetryable4xx: config.fallbackOnRetryable4xx ?? true,
+      totalRequestTimeoutMs: config.totalRequestTimeoutMs ?? DEFAULT_TIMEOUTS.totalRequestTimeoutMs,
+      maxConcurrentRequests,
+      defaultStreamMode: config.defaultStreamMode ?? 'normalized',
+      logRequestBodies: config.logRequestBodies ?? false,
+      debugSse: config.debugSse ?? false,
+      sseFailureDebugEnabled: config.sseFailureDebugEnabled ?? false,
+      sseFailureDebugDir: config.sseFailureDebugDir ?? resolve('captures', instanceName, 'sse-failures'),
+      streamMissingUsageDebugEnabled: config.streamMissingUsageDebugEnabled ?? false,
+      streamMissingUsageDebugDir: config.streamMissingUsageDebugDir ?? resolve('captures', instanceName, 'stream', 'missing-usage'),
+      fallbackOnRetryable4xx: config.fallbackOnRetryable4xx ?? true,
       fallbackOnCompat4xx: config.fallbackOnCompat4xx ?? true,
       compatFallbackPatterns: config.compatFallbackPatterns ?? [],
       clientErrorPatterns: config.clientErrorPatterns ?? [],
+      usageDbPath: usageStore?.path ?? '',
     },
     envPath: '',
     restartRequiredFields: [],
@@ -185,33 +170,33 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
     const c = getConfig();
     return {
       requestId,
-      primaryEndpoint: c.primaryEndpoint ?? primaryEndpoint,
-      fallbackEndpoints: c.fallbackEndpoints ?? fallbackEndpoints,
-      anthropicVersion: c.anthropicVersion ?? '2023-06-01',
+      routingConfig: c.routingConfig,
+      healthRegistry,
+      channelMaxAttempts: c.channelMaxAttempts,
+      channelRetryDelayMs: c.channelRetryDelayMs,
+      usageContext,
+      anthropicVersion: c.anthropicVersion,
       anthropicBeta: c.anthropicBeta,
-      defaultModel: c.defaultModel ?? 'claude-sonnet-4-5',
-      modelMappings: c.modelMappings ?? {},
+      defaultModel: c.routingConfig.defaultModel,
       claudeBillingHeaderMode: c.claudeBillingHeaderMode,
-      maxFallbackAttempts: c.maxFallbackAttempts ?? Math.max(1, fallbackEndpoints.length),
-      maxFallbackTotalMs: c.maxFallbackTotalMs ?? DEFAULT_TIMEOUTS.maxFallbackTotalMs,
-      endpointHealthStore,
-      upstreamTimeoutMs: c.upstreamTimeoutMs ?? DEFAULT_TIMEOUTS.upstreamTimeoutMs,
-      nonStreamingRequestTimeoutMs: c.nonStreamingRequestTimeoutMs ?? DEFAULT_TIMEOUTS.nonStreamingRequestTimeoutMs,
-      firstByteTimeoutMs: c.firstByteTimeoutMs ?? DEFAULT_TIMEOUTS.firstByteTimeoutMs,
-      firstTextTimeoutMs: c.firstTextTimeoutMs ?? DEFAULT_TIMEOUTS.firstTextTimeoutMs,
-      streamIdleTimeoutMs: c.streamIdleTimeoutMs ?? DEFAULT_TIMEOUTS.streamIdleTimeoutMs,
-      totalRequestTimeoutMs: c.totalRequestTimeoutMs ?? DEFAULT_TIMEOUTS.totalRequestTimeoutMs,
-      defaultStreamMode: c.defaultStreamMode ?? 'normalized',
-      logRequestBodies: c.logRequestBodies ?? false,
-      debugSse: c.debugSse ?? false,
-      sseFailureDebugEnabled: c.sseFailureDebugEnabled ?? false,
+      maxFallbackTotalMs: c.maxFallbackTotalMs,
+      upstreamTimeoutMs: c.upstreamTimeoutMs,
+      nonStreamingRequestTimeoutMs: c.nonStreamingRequestTimeoutMs,
+      firstByteTimeoutMs: c.firstByteTimeoutMs,
+      firstTextTimeoutMs: c.firstTextTimeoutMs,
+      streamIdleTimeoutMs: c.streamIdleTimeoutMs,
+      totalRequestTimeoutMs: c.totalRequestTimeoutMs,
+      defaultStreamMode: c.defaultStreamMode,
+      logRequestBodies: c.logRequestBodies,
+      debugSse: c.debugSse,
+      sseFailureDebugEnabled: c.sseFailureDebugEnabled,
       sseFailureDebugDir: c.sseFailureDebugDir,
-      streamMissingUsageDebugEnabled: c.streamMissingUsageDebugEnabled ?? false,
+      streamMissingUsageDebugEnabled: c.streamMissingUsageDebugEnabled,
       streamMissingUsageDebugDir: c.streamMissingUsageDebugDir,
-      fallbackOnRetryable4xx: c.fallbackOnRetryable4xx ?? true,
-      fallbackOnCompat4xx: c.fallbackOnCompat4xx ?? true,
-      compatFallbackPatterns: c.compatFallbackPatterns ?? [],
-      clientErrorPatterns: c.clientErrorPatterns ?? [],
+      fallbackOnRetryable4xx: c.fallbackOnRetryable4xx,
+      fallbackOnCompat4xx: c.fallbackOnCompat4xx,
+      compatFallbackPatterns: c.compatFallbackPatterns,
+      clientErrorPatterns: c.clientErrorPatterns,
       stats,
       logRequest(message, extra) {
         logRequest(requestId, message, extra);
@@ -225,7 +210,8 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
     const requestId = createRequestId();
     const startedAt = Date.now();
 
-    _requestContext.run(snap, async () => {
+    usageContext.run({ requestId, write: row => usageStore?.write(row) }, async () => {
+      _requestContext.run(snap, async () => {
       const finish = (statusCode: number, note: string, extra?: Record<string, unknown>) => {
         recordStatus(stats, statusCode);
         logRequest(requestId, note, {
@@ -264,30 +250,32 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
           sendJson(res, 200, {
             ok: true,
             instanceName,
-            primaryProviderName: c.primaryProviderName,
-            upstreamMessagesUrl: c.upstreamMessagesUrl,
-            upstreamModelsUrl: c.upstreamModelsUrl,
+            routingConfigPath: c.routingConfigPath,
+            channels: c.routingConfig.channelsById.size,
+            models: c.routingConfig.modelRoutes.size,
+            defaultModel: c.routingConfig.defaultModel,
             anthropicVersion: c.anthropicVersion,
             anthropicBeta: c.anthropicBeta ?? null,
-            modelMappings: c.modelMappings,
             claudeBillingHeaderMode: c.claudeBillingHeaderMode,
+            healthWindowMs: c.healthWindowMs,
+            healthFailureThreshold: c.healthFailureThreshold,
+            healthFailureRateThreshold: c.healthFailureRateThreshold,
+            healthCooldownMs: c.healthCooldownMs,
+            channelMaxAttempts: c.channelMaxAttempts,
+            channelRetryDelayMs: c.channelRetryDelayMs,
+            quotaCooldownMs: c.quotaCooldownMs,
             activeRequests: stats.activeRequests,
             maxConcurrentRequests,
+            usageAvailable: usageStore !== undefined,
           } as JsonValue);
           finish(200, 'health check');
           return;
         }
 
         if (req.method === 'GET' && requestPath === '/v1/models') {
-          const c = getConfig();
-          await handleModelsRequest(req, res, {
+          handleModelsRequest(req, res, {
             requestId,
-            primaryEndpoint: c.primaryEndpoint ?? primaryEndpoint,
-            anthropicVersion: c.anthropicVersion ?? '2023-06-01',
-            anthropicBeta: c.anthropicBeta,
-            modelMappings: c.modelMappings ?? {},
-            firstByteTimeoutMs: c.firstByteTimeoutMs ?? DEFAULT_TIMEOUTS.firstByteTimeoutMs,
-            upstreamTimeoutMs: c.upstreamTimeoutMs ?? DEFAULT_TIMEOUTS.upstreamTimeoutMs,
+            routingConfig: getConfig().routingConfig,
             logRequest(message, extra) {
               logRequest(requestId, message, extra);
             },
@@ -311,7 +299,7 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
           return;
         }
 
-        let requestBody: JsonRecord;
+        let requestBody;
         try {
           requestBody = await readJsonBody(req);
         } catch (error) {
@@ -345,100 +333,74 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
         });
         sendJson(res, 500, makeAnthropicError('api_error', error instanceof Error ? error.message : String(error)));
       }
+      });
     });
   });
 }
 
-function loadModelMappings(filePath: string) {
-  try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
-    const source = isJsonRecord(parsed) && isJsonRecord(parsed.model_mappings) ? parsed.model_mappings : parsed;
-    if (!isJsonRecord(source)) {
-      return {} as Record<string, string>;
-    }
-
-    const mappings: Record<string, string> = {};
-    for (const [alias, target] of Object.entries(source)) {
-      if (typeof target === 'string' && alias.trim().length > 0 && target.trim().length > 0) {
-        mappings[alias.trim()] = target.trim();
-      }
-    }
-    return mappings;
-  } catch {
-    return {} as Record<string, string>;
-  }
-}
-
-function parseClaudeBillingHeaderMode(value: string | undefined): ClaudeBillingHeaderMode {
-  const normalized = (value ?? 'strip_line').trim().toLowerCase().replace(/-/g, '_');
-  return normalized === 'strip_cch' ? 'strip_cch' : 'strip_line';
-}
-
-function parseStreamMode(value: string | undefined): StreamMode {
-  const normalized = value?.trim().toLowerCase();
-  return normalized === 'raw' ? 'raw' : 'normalized';
-}
-
-export function createConfigFromEnv(env: NodeJS.ProcessEnv = process.env): AnthropicProxyConfig & { host: string; port: number } {
-  const apiKey = env.PRIMARY_PROVIDER_API_KEY;
-  if (!apiKey) {
-    throw new Error('Missing PRIMARY_PROVIDER_API_KEY in environment');
-  }
-
-  const port = Number(env.PORT ?? 11234);
-  const primaryProviderBaseUrl = env.PRIMARY_PROVIDER_BASE_URL ?? 'https://api.anthropic.com';
-  const normalizedBaseUrl = normalizeBaseUrl(primaryProviderBaseUrl);
-  const fallbackConfigPath = env.FALLBACK_CONFIG_PATH ?? '';
-  const modelMappings = loadModelMappings(resolve(env.MODEL_MAP_PATH ?? 'model-map.json'));
-
-  const primaryEndpoint: UpstreamEndpoint = {
-    name: env.PRIMARY_PROVIDER_NAME ?? 'primary-provider',
-    url: `${normalizedBaseUrl}/v1/messages`,
-    apiKey,
-    isFallback: false,
-  };
-
-  const fallbackEndpoints = fallbackConfigPath
-    ? loadFallbackEndpoints(fallbackConfigPath, env as Record<string, string>)
-    : [];
-
+export function buildAdminStats(
+  runtimeStore: RuntimeConfigStore<AnthropicRuntimeConfig>,
+  healthRegistry: HealthRegistry,
+  proxyStats: ProxyStats,
+  usageAvailable: boolean,
+  usageWriteError: string | null,
+) {
+  const snap = runtimeStore.getSnapshot();
+  const config = snap.config;
   return {
-    host: env.HOST ?? '0.0.0.0',
-    port,
-    instanceName: env.INSTANCE_NAME ?? `anthropic-proxy-${port}`,
-    primaryProviderName: env.PRIMARY_PROVIDER_NAME ?? 'primary-provider',
-    primaryProviderBaseUrl,
-    apiKey,
-    anthropicVersion: env.ANTHROPIC_VERSION ?? '2023-06-01',
-    anthropicBeta: env.ANTHROPIC_BETA?.trim() || undefined,
-    defaultModel: env.PRIMARY_PROVIDER_DEFAULT_MODEL ?? 'claude-sonnet-4-5',
-    modelMappings,
-    claudeBillingHeaderMode: parseClaudeBillingHeaderMode(env.PROXY_CLAUDE_BILLING_HEADER_MODE),
-    primaryEndpoint,
-    fallbackEndpoints,
-    endpointTimeoutCooldownMs: Number(env.PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS ?? 120000),
-    endpointInvalidResponseCooldownMs: Number(env.PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS ?? 120000),
-    endpointAuthCooldownMs: Number(env.PROXY_ENDPOINT_AUTH_COOLDOWN_MS ?? 1800000),
-    endpointFailureThreshold: Number(env.PROXY_ENDPOINT_FAILURE_THRESHOLD ?? 1),
-    endpointHalfOpenMaxProbes: Number(env.PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES ?? 1),
-    maxFallbackAttempts: Number(env.PROXY_MAX_FALLBACK_ATTEMPTS ?? Math.max(1, fallbackEndpoints.length)),
-    maxFallbackTotalMs: Number(env.PROXY_MAX_FALLBACK_TOTAL_MS ?? DEFAULT_TIMEOUTS.maxFallbackTotalMs),
-    upstreamTimeoutMs: Number(env.PROXY_UPSTREAM_TIMEOUT_MS ?? DEFAULT_TIMEOUTS.upstreamTimeoutMs),
-    nonStreamingRequestTimeoutMs: Number(env.PROXY_NON_STREAM_TIMEOUT_MS ?? DEFAULT_TIMEOUTS.nonStreamingRequestTimeoutMs),
-    firstByteTimeoutMs: Number(env.PROXY_FIRST_BYTE_TIMEOUT_MS ?? DEFAULT_TIMEOUTS.firstByteTimeoutMs),
-    firstTextTimeoutMs: Number(env.PROXY_FIRST_TEXT_TIMEOUT_MS ?? DEFAULT_TIMEOUTS.firstTextTimeoutMs),
-    streamIdleTimeoutMs: Number(env.PROXY_STREAM_IDLE_TIMEOUT_MS ?? DEFAULT_TIMEOUTS.streamIdleTimeoutMs),
-    totalRequestTimeoutMs: Number(env.PROXY_TOTAL_REQUEST_TIMEOUT_MS ?? DEFAULT_TIMEOUTS.totalRequestTimeoutMs),
-    maxConcurrentRequests: Number(env.PROXY_MAX_CONCURRENT_REQUESTS ?? DEFAULT_TIMEOUTS.maxConcurrentRequests),
-    defaultStreamMode: parseStreamMode(env.PROXY_STREAM_MODE),
-    logRequestBodies: String(env.PROXY_LOG_REQUEST_BODY ?? '').trim() === '1',
-    debugSse: String(env.PROXY_DEBUG_SSE ?? '').trim() === '1',
-    sseFailureDebugEnabled: String(env.PROXY_SSE_FAILURE_DEBUG ?? '').trim() === '1',
-    sseFailureDebugDir: resolve(env.PROXY_SSE_FAILURE_DIR ?? `captures/${env.INSTANCE_NAME ?? `anthropic-proxy-${port}`}/sse-failures`),
-    streamMissingUsageDebugEnabled: String(env.PROXY_STREAM_MISSING_USAGE_DEBUG ?? '').trim() === '1',
-    streamMissingUsageDebugDir: resolve(
-      env.PROXY_STREAM_MISSING_USAGE_DIR ?? `captures/${env.INSTANCE_NAME ?? `anthropic-proxy-${port}`}/stream/missing-usage`,
-    ),
+    instanceName: config.instanceName,
+    host: config.host,
+    port: config.port,
+    routingConfigPath: config.routingConfigPath,
+    defaultModel: config.routingConfig.defaultModel,
+    anthropicVersion: config.anthropicVersion,
+    anthropicBeta: config.anthropicBeta ?? null,
+    claudeBillingHeaderMode: config.claudeBillingHeaderMode,
+    channels: Array.from(config.routingConfig.channelsById.values()).map(channel => ({
+      id: channel.id,
+      name: channel.name,
+      baseUrl: channel.baseUrl,
+      disableCooldown: channel.disableCooldown,
+      fingerprint: channel.fingerprint,
+    })),
+    models: Array.from(config.routingConfig.modelRoutes.values()).map(route => ({
+      canonicalModel: route.canonicalModel,
+      channelIds: [...route.channelIds],
+    })),
+    aliases: { ...config.routingConfig.aliases },
+    healthWindowMs: config.healthWindowMs,
+    healthFailureThreshold: config.healthFailureThreshold,
+    healthFailureRateThreshold: config.healthFailureRateThreshold,
+    healthCooldownMs: config.healthCooldownMs,
+    channelMaxAttempts: config.channelMaxAttempts,
+    channelRetryDelayMs: config.channelRetryDelayMs,
+    quotaCooldownMs: config.quotaCooldownMs,
+    maxFallbackTotalMs: config.maxFallbackTotalMs,
+    upstreamTimeoutMs: config.upstreamTimeoutMs,
+    nonStreamingRequestTimeoutMs: config.nonStreamingRequestTimeoutMs,
+    firstByteTimeoutMs: config.firstByteTimeoutMs,
+    firstTextTimeoutMs: config.firstTextTimeoutMs,
+    streamIdleTimeoutMs: config.streamIdleTimeoutMs,
+    totalRequestTimeoutMs: config.totalRequestTimeoutMs,
+    maxConcurrentRequests: config.maxConcurrentRequests,
+    defaultStreamMode: config.defaultStreamMode,
+    logRequestBodies: config.logRequestBodies,
+    debugSse: config.debugSse,
+    sseFailureDebugEnabled: config.sseFailureDebugEnabled,
+    sseFailureDebugDir: config.sseFailureDebugDir,
+    streamMissingUsageDebugEnabled: config.streamMissingUsageDebugEnabled,
+    streamMissingUsageDebugDir: config.streamMissingUsageDebugDir,
+    fallbackOnRetryable4xx: config.fallbackOnRetryable4xx,
+    fallbackOnCompat4xx: config.fallbackOnCompat4xx,
+    compatFallbackPatterns: [...config.compatFallbackPatterns],
+    clientErrorPatterns: [...config.clientErrorPatterns],
+    usageAvailable,
+    usageWriteError,
+    usageDbPath: config.usageDbPath,
+    uptimeIntervalMs: UPTIME_INTERVAL_MS,
+    routingAttempts: { ...routingAttemptStats },
+    healthSnapshot: healthRegistry.snapshot(),
+    stats: { ...proxyStats },
   };
 }
 
@@ -448,91 +410,47 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   _runtimeStore = runtimeStore;
   const snap = runtimeStore.getSnapshot();
   _initialSnapshot = snap;
-  const endpointHealthStore = createEndpointHealthStore({
-    endpointTimeoutCooldownMs: snap.config.endpointTimeoutCooldownMs,
-    endpointInvalidResponseCooldownMs: snap.config.endpointInvalidResponseCooldownMs,
-    endpointAuthCooldownMs: snap.config.endpointAuthCooldownMs,
-    endpointFailureThreshold: snap.config.endpointFailureThreshold,
-    endpointHalfOpenMaxProbes: snap.config.endpointHalfOpenMaxProbes,
+
+  const healthRegistry = createHealthRegistry({
+    healthWindowMs: snap.config.healthWindowMs,
+    healthFailureThreshold: snap.config.healthFailureThreshold,
+    healthFailureRateThreshold: snap.config.healthFailureRateThreshold,
+    healthCooldownMs: snap.config.healthCooldownMs,
+    quotaCooldownMs: snap.config.quotaCooldownMs,
   });
+  runtimeStore.registerHealthRegistry(healthRegistry);
+
+  const usageStore = createUsageStore(snap.config.usageDbPath);
+  const stopUptime = startUptimeSampling(runtimeStore, healthRegistry, usageStore);
+  const proxyStats = createProxyStats();
   const adminConfigStore = createConfigFileStoreFromPaths({
     envPath,
-    fallbackPath: snap.config.fallbackConfigPath,
-    modelMapPath: snap.config.modelMappingPath,
+    fallbackPath: snap.config.routingConfigPath,
   });
-  const proxyStats = createProxyStats();
-  const getAdminStats = () => {
-    const snapNow = runtimeStore.getSnapshot();
-    return {
-      instanceName: snapNow.config.instanceName,
-      host: snapNow.config.host,
-      port: snapNow.config.port,
-      primaryProviderName: snapNow.config.primaryProviderName,
-      anthropicVersion: snapNow.config.anthropicVersion,
-      anthropicBeta: snapNow.config.anthropicBeta ?? null,
-      upstreamMessagesUrl: snapNow.config.upstreamMessagesUrl,
-      upstreamModelsUrl: snapNow.config.upstreamModelsUrl,
-      fallbackConfigPath: snapNow.config.fallbackConfigPath,
-      modelMappingPath: snapNow.config.modelMappingPath,
-      fallbackNames: snapNow.config.fallbackEndpoints.map(item => item.name),
-      claudeBillingHeaderMode: snapNow.config.claudeBillingHeaderMode,
-      modelMappings: snapNow.config.modelMappings,
-      activeRequests: proxyStats.activeRequests,
-      upstreamTimeoutMs: snapNow.config.upstreamTimeoutMs,
-      nonStreamingRequestTimeoutMs: snapNow.config.nonStreamingRequestTimeoutMs,
-      firstByteTimeoutMs: snapNow.config.firstByteTimeoutMs,
-      firstTextTimeoutMs: snapNow.config.firstTextTimeoutMs,
-      streamIdleTimeoutMs: snapNow.config.streamIdleTimeoutMs,
-      totalRequestTimeoutMs: snapNow.config.totalRequestTimeoutMs,
-      maxConcurrentRequests: snapNow.config.maxConcurrentRequests,
-      defaultStreamMode: snapNow.config.defaultStreamMode,
-      logRequestBodies: snapNow.config.logRequestBodies,
-      debugSse: snapNow.config.debugSse,
-      sseFailureDebugEnabled: snapNow.config.sseFailureDebugEnabled,
-      sseFailureDebugDir: snapNow.config.sseFailureDebugDir,
-      streamMissingUsageDebugEnabled: snapNow.config.streamMissingUsageDebugEnabled,
-      streamMissingUsageDebugDir: snapNow.config.streamMissingUsageDebugDir,
-      fallbackOnRetryable4xx: snapNow.config.fallbackOnRetryable4xx,
-      fallbackOnCompat4xx: snapNow.config.fallbackOnCompat4xx,
-      compatFallbackPatterns: snapNow.config.compatFallbackPatterns,
-      clientErrorPatterns: snapNow.config.clientErrorPatterns,
-      endpointTimeoutCooldownMs: snapNow.config.endpointTimeoutCooldownMs,
-      endpointInvalidResponseCooldownMs: snapNow.config.endpointInvalidResponseCooldownMs,
-      endpointAuthCooldownMs: snapNow.config.endpointAuthCooldownMs,
-      endpointFailureThreshold: snapNow.config.endpointFailureThreshold,
-      endpointHalfOpenMaxProbes: snapNow.config.endpointHalfOpenMaxProbes,
-      maxFallbackAttempts: snapNow.config.maxFallbackAttempts,
-      maxFallbackTotalMs: snapNow.config.maxFallbackTotalMs,
-      endpointHealth: endpointHealthStore.listSnapshots(snapNow.config.allEndpoints),
-      stats: { ...proxyStats },
-    };
-  };
   const adminHandler = createAdminHandler({
     configStore: adminConfigStore,
     runtimeStore,
-    getAdminStats,
+    healthRegistry,
+    usageStore,
+    getAdminStats: () => buildAdminStats(runtimeStore, healthRegistry, proxyStats, true, usageStore.writeError()),
   });
+
   const s = snap.config;
-  const baseConfig: AnthropicProxyConfig & { host: string; port: number } = {
+  const config: AnthropicProxyConfig & { host: string; port: number } = {
     port: s.port,
     host: s.host,
     instanceName: s.instanceName,
-    primaryProviderName: s.primaryProviderName,
-    primaryProviderBaseUrl: s.primaryProviderBaseUrl,
-    apiKey: s.apiKey,
+    routingConfig: s.routingConfig,
     anthropicVersion: s.anthropicVersion,
     anthropicBeta: s.anthropicBeta,
-    defaultModel: s.defaultModel,
-    modelMappings: s.modelMappings,
     claudeBillingHeaderMode: s.claudeBillingHeaderMode,
-    primaryEndpoint: s.primaryEndpoint,
-    fallbackEndpoints: s.fallbackEndpoints,
-    endpointTimeoutCooldownMs: s.endpointTimeoutCooldownMs,
-    endpointInvalidResponseCooldownMs: s.endpointInvalidResponseCooldownMs,
-    endpointAuthCooldownMs: s.endpointAuthCooldownMs,
-    endpointFailureThreshold: s.endpointFailureThreshold,
-    endpointHalfOpenMaxProbes: s.endpointHalfOpenMaxProbes,
-    maxFallbackAttempts: s.maxFallbackAttempts,
+    healthWindowMs: s.healthWindowMs,
+    healthFailureThreshold: s.healthFailureThreshold,
+    healthFailureRateThreshold: s.healthFailureRateThreshold,
+    healthCooldownMs: s.healthCooldownMs,
+    quotaCooldownMs: s.quotaCooldownMs,
+    channelMaxAttempts: s.channelMaxAttempts,
+    channelRetryDelayMs: s.channelRetryDelayMs,
     maxFallbackTotalMs: s.maxFallbackTotalMs,
     upstreamTimeoutMs: s.upstreamTimeoutMs,
     nonStreamingRequestTimeoutMs: s.nonStreamingRequestTimeoutMs,
@@ -548,49 +466,63 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     sseFailureDebugDir: s.sseFailureDebugDir,
     streamMissingUsageDebugEnabled: s.streamMissingUsageDebugEnabled,
     streamMissingUsageDebugDir: s.streamMissingUsageDebugDir,
+    fallbackOnRetryable4xx: s.fallbackOnRetryable4xx,
+    fallbackOnCompat4xx: s.fallbackOnCompat4xx,
+    compatFallbackPatterns: s.compatFallbackPatterns,
+    clientErrorPatterns: s.clientErrorPatterns,
     stats: proxyStats,
+    adminHandler,
+    healthRegistry,
+    usageStore,
   };
-  const config = { ...baseConfig, adminHandler, endpointHealthStore };
   const server = createAnthropicProxyServer(config);
   server.listen(config.port, config.host, () => {
     console.log(`Instance: ${s.instanceName}`);
     console.log(`Anthropic proxy listening on http://${s.host}:${s.port}`);
-    console.log(`Primary provider: ${s.primaryProviderName}`);
-    console.log(`Forwarding POST /v1/messages to ${s.upstreamMessagesUrl}`);
-    console.log(`Fallback config path: ${s.fallbackConfigPath}`);
-    console.log(`Model mapping path: ${s.modelMappingPath}`);
-    console.log(
-      `Model aliases: ${Object.keys(s.modelMappings).length === 0 ? 'none' : Object.entries(s.modelMappings).map(([alias, target]) => `${alias} -> ${target}`).join(', ')}`,
-    );
+    console.log(`Routing config: ${s.routingConfigPath}`);
+    console.log(`Channels: ${s.routingConfig.channelsById.size}, canonical models: ${s.routingConfig.modelRoutes.size}, aliases: ${Object.keys(s.routingConfig.aliases).length}`);
+    console.log(`Default model: ${s.routingConfig.defaultModel}`);
+    console.log(`Health window: ${s.healthWindowMs}ms, failure threshold: ${s.healthFailureThreshold}, failure rate > ${s.healthFailureRateThreshold}, cooldown: ${s.healthCooldownMs}ms`);
+    console.log(`Channel attempts per request: ${s.channelMaxAttempts} (retry delay ${s.channelRetryDelayMs}ms), quota cooldown: ${s.quotaCooldownMs}ms`);
     console.log(`Concurrency limit: ${s.maxConcurrentRequests}, upstream timeout: ${s.upstreamTimeoutMs}ms`);
     console.log(`Non-stream upstream timeout: ${s.nonStreamingRequestTimeoutMs}ms`);
     console.log(`First-byte timeout: ${s.firstByteTimeoutMs}ms, stream idle timeout: ${s.streamIdleTimeoutMs}ms`);
     console.log(`First-text timeout: ${s.firstTextTimeoutMs <= 0 ? 'disabled' : `${s.firstTextTimeoutMs}ms`}`);
-    console.log(`Total request lifetime timeout: ${s.totalRequestTimeoutMs}ms`);
+    console.log(`Total request lifetime timeout: ${s.totalRequestTimeoutMs}ms, fallback total budget: ${s.maxFallbackTotalMs}ms`);
     console.log(`Default stream mode: ${s.defaultStreamMode}`);
     console.log(`Claude billing header mode: ${s.claudeBillingHeaderMode}`);
     console.log(`Request body logging: ${s.logRequestBodies ? 'enabled' : 'disabled'}`);
     console.log(`SSE debug logging: ${s.debugSse ? 'enabled' : 'disabled'}`);
     console.log(`Retryable 4xx fallback: ${s.fallbackOnRetryable4xx ? 'enabled' : 'disabled'}`);
     console.log(`Compatibility 4xx fallback: ${s.fallbackOnCompat4xx ? 'enabled' : 'disabled'}`);
-    console.log(`Endpoint timeout cooldown: ${s.endpointTimeoutCooldownMs}ms`);
-    console.log(`Endpoint invalid-response cooldown: ${s.endpointInvalidResponseCooldownMs}ms`);
-    console.log(`Endpoint auth cooldown: ${s.endpointAuthCooldownMs}ms`);
-    console.log(`Endpoint failure threshold: ${s.endpointFailureThreshold}`);
-    console.log(`Endpoint half-open max probes: ${s.endpointHalfOpenMaxProbes}`);
-    console.log(`Fallback attempt budget: ${s.maxFallbackAttempts}`);
-    console.log(`Fallback total budget: ${s.maxFallbackTotalMs}ms`);
     console.log(`SSE failure capture: ${s.sseFailureDebugEnabled ? `enabled -> ${s.sseFailureDebugDir}` : 'disabled'}`);
     console.log(`Stream missing usage capture: ${s.streamMissingUsageDebugEnabled ? `enabled -> ${s.streamMissingUsageDebugDir}` : 'disabled'}`);
-    console.log(`Fallback upstreams: ${s.fallbackEndpoints.length === 0 ? 'none' : s.fallbackEndpoints.map(item => item.name).join(', ')}`);
+    console.log(`Usage database: ${s.usageDbPath}`);
+    console.log(`Uptime sampling every ${UPTIME_INTERVAL_MS}ms, ${collectUptime(runtimeStore, healthRegistry).length} channel/model pairs`);
     console.log(JSON.stringify({
       level: 'info',
       msg: 'Anthropic Messages compatibility proxy listening',
-      instanceName: config.instanceName,
-      host: config.host,
-      port: config.port,
-      upstreamMessagesUrl: `${normalizeBaseUrl(config.primaryProviderBaseUrl)}/v1/messages`,
-      upstreamModelsUrl: `${normalizeBaseUrl(config.primaryProviderBaseUrl)}/v1/models`,
+      instanceName: s.instanceName,
+      host: s.host,
+      port: s.port,
+      routingConfigPath: s.routingConfigPath,
+      channels: s.routingConfig.channelsById.size,
+      models: s.routingConfig.modelRoutes.size,
+      upstreamBaseUrls: Array.from(new Set(Array.from(s.routingConfig.channelsById.values()).map(channel => normalizeBaseUrl(channel.baseUrl)))),
     }));
   });
+
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}; draining usage writes and closing the listener`);
+    stopUptime();
+    server.close(() => {
+      void usageStore.close().finally(() => process.exit(0));
+    });
+    setTimeout(() => process.exit(0), 10000).unref();
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }

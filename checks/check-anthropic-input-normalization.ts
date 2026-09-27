@@ -25,10 +25,7 @@ function main() {
       proxy_stream_mode: 'normalized',
     },
     {
-      defaultModel: 'claude-sonnet-4-5',
-      modelMappings: {
-        'public-claude': 'claude-sonnet-4-5',
-      },
+      canonicalModel: 'claude-sonnet-4-5',
       claudeBillingHeaderMode: 'strip_line',
     },
   );
@@ -58,8 +55,7 @@ function main() {
       messages: [{ role: 'user', content: 'Hi' }],
     },
     {
-      defaultModel: 'claude-haiku-4-5',
-      modelMappings: {},
+      canonicalModel: 'claude-haiku-4-5',
       claudeBillingHeaderMode: 'strip_line',
     },
   );
@@ -84,8 +80,7 @@ function main() {
       ],
     },
     {
-      defaultModel: 'claude-sonnet-4-5',
-      modelMappings: {},
+      canonicalModel: 'claude-opus-4-5',
       claudeBillingHeaderMode: 'strip_cch',
     },
   );
@@ -102,6 +97,12 @@ function main() {
       content: 'x-anthropic-billing-header: cch=user-value;\nKeep user text intact',
     },
   ]);
+
+  const aliased = normalizeAnthropicMessageRequest(
+    { model: 'public-claude', messages: [{ role: 'user', content: 'Hi' }] },
+    { canonicalModel: 'claude-sonnet-4-5', claudeBillingHeaderMode: 'strip_line' },
+  );
+  assert.equal(aliased.model, 'claude-sonnet-4-5', 'aliases are resolved before the body is forwarded');
 
   console.log('Anthropic input normalization checks passed.');
 }

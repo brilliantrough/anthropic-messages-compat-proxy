@@ -8,7 +8,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { getAvailablePort } from './_helpers.js';
+import { getAvailablePort, instanceEnvPath, writeRoutingConfig } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -96,6 +96,11 @@ async function main() {
   const fallbackConfigPath = path.join(tempDir, 'fallback.json');
   await writeFile(fallbackConfigPath, JSON.stringify({ fallback_api_config: [{ name: 'fallback-a', base_url: `http://127.0.0.1:${fallbackAddress.port}`, api_key: 'fallback-key' }] }, null, 2), 'utf8');
 
+  const routingConfigPath = await writeRoutingConfig(tempDir, {
+    primary: { name: 'missing-usage-primary', baseUrl: `http://127.0.0.1:${primaryAddress.port}`, apiKey: 'primary-key' },
+    legacyFallbackPath: fallbackConfigPath,
+  });
+
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
     cwd: workspaceRoot,
@@ -104,10 +109,9 @@ async function main() {
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
       INSTANCE_NAME: 'anthropic-proxy-nonstream-missing-usage-check',
-      PRIMARY_PROVIDER_NAME: 'missing-usage-primary',
-      PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
-      PRIMARY_PROVIDER_API_KEY: 'primary-key',
-      FALLBACK_CONFIG_PATH: fallbackConfigPath,
+
+      PROXY_ENV_PATH: instanceEnvPath(tempDir),
+      FALLBACK_CONFIG_PATH: routingConfigPath,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -128,20 +132,19 @@ async function main() {
 
     assert.equal(response.status, 200);
     const body = await response.json() as { id?: string };
-    assert.equal(body.id, 'msg_missing_usage_fallback');
+    assert.equal(body.id, 'msg_missing_usage_primary', 'usable output must win even when usage is missing');
     assert.equal(primaryRequests, 1);
-    assert.equal(fallbackRequests, 1);
+    assert.equal(fallbackRequests, 0, 'missing usage must not trigger another upstream attempt');
 
     const statsResponse = await fetch(`http://127.0.0.1:${proxyPort}/admin/stats`);
-    const stats = await statsResponse.json() as { stats?: { responsesJson?: number; fallbackReasons?: Record<string, number> } };
-    assert.ok((stats.stats?.responsesJson ?? 0) >= 1, 'fallback success should still yield one accepted JSON response overall');
-    assert.ok((stats.stats?.fallbackReasons?.streamMissingUsage ?? 0) >= 1, 'streamMissingUsage bucket should increment');
+    const stats = await statsResponse.json() as { stats?: { responsesJson?: number } };
+    assert.ok((stats.stats?.responsesJson ?? 0) >= 1, 'the primary response should be counted as one JSON response');
 
     const stdoutText = stdout.join('');
-    assert.match(stdoutText, /upstream json response incomplete, falling back/, 'expected missing-usage source fallback log');
-    assert.match(stdoutText, /"fallbackReason":"stream_missing_usage"/, 'expected stream_missing_usage source fallback reason');
+    assert.match(stdoutText, /usable output without extractable usage; keeping the response/, 'expected the keep-response log');
+    assert.doesNotMatch(stdoutText, /missing-usage.*falling back/, 'missing usage must not produce a fallback log');
 
-    console.log('Anthropic non-stream missing-usage fallback check passed.');
+    console.log('Anthropic non-stream missing-usage check passed (no fallback, NULL usage).');
   } finally {
     proxy.kill('SIGTERM');
     await Promise.race([once(proxy, 'exit'), delay(3000).then(() => proxy.kill('SIGKILL'))]);

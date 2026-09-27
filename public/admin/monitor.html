@@ -1,48 +1,61 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Provider Monitor</title>
+<meta name="theme-color" content="#ffffff">
+<title>渠道监控 · Anthropic Relay</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ffffff'/%3E%3Cpath d='M8 12v13m8-19v19m8-16v11' stroke='%233b63dc' stroke-width='4'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/admin/assets/monitor.css">
 </head>
 <body>
-<main class="monitor-shell">
-  <header class="monitor-header">
-    <div>
-      <h1>Provider Monitor</h1>
-      <p>Live proxy and upstream health. Polling is quiet and does not add per-refresh log lines.</p>
-    </div>
-    <p id="monitor-status">Loading...</p>
-  </header>
+<a class="skip-link" href="#main-content">跳转到主内容</a>
+<div class="app-shell">
+  <aside class="app-sidebar">
+    <a class="brand" href="/admin" aria-label="Anthropic 管理首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>relay<span class="brand-caption">ANTHROPIC MESSAGES GATEWAY</span></span></a>
+    <div class="workspace-label"><span class="workspace-avatar">R</span><div>代理工作区<small>Anthropic Messages API</small></div></div>
+    <nav class="app-nav" aria-label="主导航">
+      <div class="nav-label">工作区</div>
+      <a class="nav-link active" href="/admin/monitor" aria-current="page"><span class="nav-icon" aria-hidden="true">◷</span>概览<span class="nav-live">实时</span></a>
+      <a id="usage-nav" class="nav-link" href="/admin/usage" hidden><span class="nav-icon" aria-hidden="true">▥</span>用量<span class="nav-live">历史</span></a>
+      <div class="nav-label">配置</div>
+      <a class="nav-link" href="/admin#channels"><span class="nav-icon" aria-hidden="true">⊞</span>渠道</a>
+      <a class="nav-link" href="/admin#models"><span class="nav-icon" aria-hidden="true">⑂</span>模型路由</a>
+      <a class="nav-link" href="/admin#aliases"><span class="nav-icon" aria-hidden="true">↗</span>别名</a>
+      <div class="nav-label">系统</div>
+      <a class="nav-link" href="/admin#environment"><span class="nav-icon" aria-hidden="true">⚙︎</span>环境</a>
+      <a class="nav-link" href="/admin#runtime"><span class="nav-icon" aria-hidden="true">≡</span>运行态</a>
+    </nav>
+    <div class="sidebar-footer"><span class="sidebar-dot"></span><div>Anthropic Messages 代理<small>配置与可观测性</small></div><span class="footer-version">v1</span></div>
+  </aside>
 
-  <section id="global-cards" class="cards"></section>
+  <div class="app-main">
+    <header class="topbar"><div class="breadcrumb">工作区 <span>/</span> <strong>概览</strong></div><div class="topbar-status"><span id="monitor-instance" class="badge">实例 —</span><span class="badge">每秒刷新</span></div></header>
+    <main id="main-content" class="monitor-shell content-grid" tabindex="-1">
+      <div class="page-heading monitor-header"><div><div class="eyebrow">代理运行监控</div><h1>代理运行概况</h1><p>实时流量、模型路由及各渠道健康状态。</p></div><a class="button-link" href="/admin">管理配置 <span aria-hidden="true">↗</span></a></div>
+      <div class="monitor-status-line"><p id="monitor-status" role="status">正在连接实例…</p><div class="health-legend"><span><i class="legend-dot state-ok"></i>正常</span><span><i class="legend-dot state-warn"></i>半开</span><span><i class="legend-dot state-bad"></i>熔断</span><span><i class="legend-dot state-quota"></i>额度阻断</span></div></div>
+      <section id="global-cards" class="cards" aria-label="实时请求统计"></section>
+      <p id="breaker-policy" class="field-helper" hidden></p>
 
-  <section class="panel">
-    <h2>Provider Health</h2>
-    <table id="provider-table">
-      <thead>
-        <tr>
-          <th>State</th>
-          <th>Name</th>
-          <th>Type</th>
-          <th>Cooldown</th>
-          <th>Failures</th>
-          <th>Successes</th>
-          <th>Last Failure</th>
-          <th>Last Success</th>
-          <th>URL</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </section>
+      <section class="panel traffic-panel" aria-labelledby="traffic-title"><div class="panel-heading"><div><div class="eyebrow">流量</div><h2 id="traffic-title">活跃请求</h2><p>页面可见时每秒记录一次并发数。</p></div><span id="trend-peak" class="badge">峰值 —</span></div><div class="chart-wrap"><div class="chart-grid" aria-hidden="true"><span></span><span></span><span></span></div><div id="trend-bars" class="trend-bars" role="img" aria-label="最近活跃请求采样"></div><div id="trend-empty" class="chart-empty">暂无流量 · 当前无活跃请求</div></div><div class="chart-axis"><span id="trend-start">采样中</span><span>当前</span></div></section>
 
-  <section class="panel">
-    <h2>Recent Active Requests</h2>
-    <div id="trend-bars" class="trend-bars"></div>
-  </section>
-</main>
+      <section class="panel" aria-labelledby="routes-title"><div class="panel-heading"><div><h2 id="routes-title">路由概览</h2><p>显示每个模型的渠道优先级。选择模型可查看对应渠道。</p></div><span id="monitor-route-count" class="badge">— 个模型</span></div><div class="table-scroll"><table id="route-table"><thead><tr><th>规范模型</th><th>渠道优先级 <span class="th-note">首选 → 末位</span></th></tr></thead><tbody></tbody></table></div></section>
+
+      <section class="panel" aria-labelledby="health-title"><div class="panel-heading"><div><h2 id="health-title">渠道健康状态</h2><p>进程启动以来的上游尝试累计与熔断状态。</p></div><span id="monitor-channel-count" class="badge">— 个渠道</span></div><div class="table-scroll"><table id="channel-table"><thead><tr>
+        <th class="stat-col-channel">渠道</th>
+        <th class="stat-col-state" title="自动熔断、额度熔断和人工熔断后的最终状态">状态</th>
+        <th class="stat-col-requests" title="进程启动以来该渠道的所有模型上游尝试总数，不自动清零">尝试数</th>
+        <th class="stat-col-split" title="进程启动以来该渠道所有模型累计成功 / 失败次数，不自动清零">S / F</th>
+        <th class="stat-col-rate" title="该渠道所有模型的累计成功率">成功率</th>
+        <th class="stat-col-breaker" title="滑动窗口成功 / 失败次数与失败率；熔断需同时达到次数和比例阈值">窗口统计</th>
+        <th class="stat-col-cooldown" title="自动冷却剩余秒数">冷却</th>
+        <th class="stat-col-reason" title="该渠道最近一次失败原因">原因</th>
+        <th class="stat-col-last-ok" title="最近成功时间及立即熔断 / 恢复操作">最近成功 / 操作</th>
+      </tr></thead><tbody></tbody></table></div></section>
+      <footer class="workspace-footer"><span>当前实例实时数据 · 计数自进程启动以来累计</span><a href="/admin/usage#uptime">渠道可用性与用量分析 ↗</a><a href="/admin">熔断配置 ↗</a></footer>
+    </main>
+  </div>
+</div>
 <script src="/admin/assets/monitor.js"></script>
 </body>
 </html>

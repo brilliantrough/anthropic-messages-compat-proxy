@@ -1,11 +1,14 @@
 # Quickstart
 
-This guide gets a local proxy instance running from a clean checkout with public-safe example files.
+This guide starts one local Anthropic Messages proxy instance from the tracked public example files.
+
+The client sends Anthropic `POST /v1/messages` requests to this proxy. The proxy forwards Anthropic Messages requests upstream and calls the upstream `/v1/messages` and `/v1/models` endpoints built from your configured base URL.
 
 ## Requirements
 
-- `Node 22+` and `npm` are recommended for local runs.
-- If you want the fewest local prerequisites, use the Docker path in `README.md` or `docs/operations.md` instead.
+- `Node 22+`
+- `npm`
+- An upstream provider that accepts Anthropic-style `/v1/messages`
 
 ## 1. Install Dependencies
 
@@ -13,127 +16,155 @@ This guide gets a local proxy instance running from a clean checkout with public
 npm install
 ```
 
-## 2. Create a Local Runtime Instance
+## 2. Create Runtime Files
 
-Copy the tracked example directory and create local runtime files inside it:
+Copy the checked-in example instance, then create local runtime files from the examples:
 
 ```bash
 cp -r instances/example-11234 instances/proxy-11234
 cp instances/proxy-11234/.env.example instances/proxy-11234/.env
 cp instances/proxy-11234/fallback.json.example instances/proxy-11234/fallback.json
-cp instances/proxy-11234/model-map.json.example instances/proxy-11234/model-map.json
+chmod 600 instances/proxy-11234/fallback.json
 ```
 
-`instances/proxy-11234/` is gitignored. Keep your real credentials there, not in tracked example files.
+Keep real keys in `instances/proxy-11234/`. The runtime copy is gitignored, while the `*.example` files stay public-safe.
 
-The tracked `fallback.json.example` starts with an empty `fallback_api_config` so your first run does not accidentally call placeholder fallback domains.
+## 3. Configure Channels And Models
 
-## 3. Fill the Required Provider Fields
+Edit `instances/proxy-11234/fallback.json` and declare at least one channel plus the models it serves:
 
-Edit `instances/proxy-11234/.env` and set:
+```json
+{
+  "default_model": "claude-sonnet-4-5",
+  "channels": [
+    {
+      "id": "provider-a",
+      "name": "Provider A",
+      "base_url": "https://api.anthropic.com",
+      "api_key": "your_api_key_here"
+    }
+  ],
+  "models": {
+    "claude-sonnet-4-5": { "channel_ids": ["provider-a"] }
+  },
+  "aliases": {
+    "public-claude": "claude-sonnet-4-5"
+  }
+}
+```
+
+The proxy sends Messages calls to `<base_url>/v1/messages` and model-list calls to `<base_url>/v1/models`, with trailing slashes removed from `base_url`.
+
+The client may send any local `x-api-key`; that value is never forwarded upstream. The outbound upstream `x-api-key` comes from the channel that serves the request.
+
+Only the canonical models listed under `models` can be requested. `public-claude` is an alias: it resolves to `claude-sonnet-4-5` before the request goes upstream, and responses echo the alias the client asked for.
+
+## 4. Check Instance File Paths
+
+The example `.env` already points the runtime and admin UI at the copied files:
 
 ```env
-PRIMARY_PROVIDER_NAME=primary-provider
-PRIMARY_PROVIDER_BASE_URL=https://provider.example
-PRIMARY_PROVIDER_API_KEY=your_api_key_here
+PROXY_ENV_PATH=./instances/proxy-11234/.env
+FALLBACK_CONFIG_PATH=./instances/proxy-11234/fallback.json
 ```
 
-You will usually also want:
+`fallback.json` is the routing document from step 3. Usage history is written to `usage.sqlite` beside it unless `PROXY_USAGE_DB_PATH` overrides the path.
 
-```env
-PRIMARY_PROVIDER_DEFAULT_MODEL=my-model-v2
-```
-
-The example file already includes:
-
-- `PROXY_ENV_PATH=./instances/proxy-11234/.env`
-- `FALLBACK_CONFIG_PATH=./instances/proxy-11234/fallback.json`
-- `MODEL_MAP_PATH=./instances/proxy-11234/model-map.json`
-
-That keeps the admin UI pointed at the same runtime files you started with.
-
-The shipped `.env.example` also keeps `HOST=0.0.0.0` so the same runtime files work in Docker. For a local-only first run outside Docker, set `HOST=127.0.0.1`.
-
-## 4. Build and Start
+## 5. Build
 
 ```bash
 npm run build
-env $(grep -v '^#' instances/proxy-11234/.env | xargs) npm run proxy:start
 ```
 
-This command loads the instance `.env` values into the current shell process and starts `dist/json-proxy.js`.
+## 6. Load The Instance Environment And Start
 
-## 5. Check Health
+```bash
+node --env-file=instances/proxy-11234/.env dist/anthropic-proxy.js
+```
+
+The command runs the compiled Anthropic proxy entrypoint. `PROXY_ENV_PATH` tells the runtime which `.env` file the admin reload flow should read.
+
+## 7. Check Health
 
 ```bash
 curl -s http://127.0.0.1:11234/healthz
 ```
 
-Expected shape:
+Expected fields include `ok`, `instanceName`, `primaryProviderName`, `upstreamMessagesUrl`, `upstreamModelsUrl`, `anthropicVersion`, `modelMappings`, and `claudeBillingHeaderMode`.
 
-```json
-{
-  "ok": true,
-  "instanceName": "proxy-11234",
-  "port": 11234
-}
-```
-
-## 6. Send a Non-Streaming Request
+## 8. Send A Non-Streaming Message
 
 ```bash
-curl -s http://127.0.0.1:11234/v1/responses \
+curl -s http://127.0.0.1:11234/v1/messages \
   -H 'Content-Type: application/json' \
-  -d '{"model":"my-model-v2","input":"Reply with exactly OK.","stream":false}'
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"public-claude","max_tokens":128,"messages":[{"role":"user","content":"Reply with exactly OK."}]}'
 ```
 
-## 7. Send a Streaming Request
+The body is Anthropic-native. It uses `model`, `max_tokens`, and `messages`.
+
+Because `public-claude` is an alias, the proxy forwards `claude-sonnet-4-5` upstream and echoes `public-claude` in successful JSON responses.
+
+## 9. Send A Streaming Message
 
 ```bash
-curl -N http://127.0.0.1:11234/v1/responses \
+curl -N http://127.0.0.1:11234/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
-  -d '{"model":"my-model-v2","input":"Count to three.","stream":true}'
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"public-claude","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"Count to three."}]}'
 ```
 
-In `normalized` mode, you should see Responses-style SSE events such as `response.created`, `response.output_text.delta`, and `response.completed`.
+You should see Anthropic SSE events such as `message_start`, `content_block_start`, `content_block_delta`, `message_delta`, and `message_stop`.
 
-## 8. Open the Local Admin Pages
+In default `normalized` mode, the proxy rewrites the model in `message_start` back to the client-requested alias after usable output begins.
+
+## 10. Open Admin Pages
 
 - Config UI: `http://127.0.0.1:11234/admin`
-- Provider monitor: `http://127.0.0.1:11234/admin/monitor`
+- Monitor UI: `http://127.0.0.1:11234/admin/monitor`
+- Usage UI: `http://127.0.0.1:11234/admin/usage`
 
-By default both are localhost-only and remote requests receive `403 Forbidden`. If you later enable `PROXY_ADMIN_ALLOW_HOST=1`, non-localhost requests are accepted too, so keep the published port on a trusted host.
+Admin routes are localhost-only by default. Set `PROXY_ADMIN_ALLOW_HOST=1` only behind trusted network controls.
 
-## Recommended Starting Values
+## Recommended First-Run Settings
 
-The example `.env` already uses conservative defaults that work well for many providers:
+The checked-in example uses these active defaults and starting values:
 
 ```env
-PROXY_STREAM_MODE=normalized
-PROXY_UPSTREAM_TIMEOUT_MS=50000
-PROXY_NON_STREAM_TIMEOUT_MS=240000
-PROXY_FIRST_BYTE_TIMEOUT_MS=40000
-PROXY_FIRST_TEXT_TIMEOUT_MS=120000
-PROXY_STREAM_IDLE_TIMEOUT_MS=70000
-PROXY_TOTAL_REQUEST_TIMEOUT_MS=700000
-PROXY_MAX_FALLBACK_TOTAL_MS=480000
+PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line
+PROXY_UPSTREAM_TIMEOUT_MS=30000
+PROXY_NON_STREAM_TIMEOUT_MS=300000
+PROXY_FIRST_BYTE_TIMEOUT_MS=30000
+PROXY_FIRST_TEXT_TIMEOUT_MS=12000
+PROXY_STREAM_IDLE_TIMEOUT_MS=60000
+PROXY_TOTAL_REQUEST_TIMEOUT_MS=600000
 PROXY_MAX_CONCURRENT_REQUESTS=128
-PROXY_MAX_CACHED_RESPONSES=200
+PROXY_MAX_FALLBACK_TOTAL_MS=30000
+PROXY_HEALTH_WINDOW_MS=180000
+PROXY_HEALTH_FAILURE_THRESHOLD=15
+PROXY_HEALTH_FAILURE_RATE_THRESHOLD=0.5
+PROXY_HEALTH_COOLDOWN_MS=600000
+PROXY_CHANNEL_MAX_ATTEMPTS=3
+PROXY_CHANNEL_RETRY_DELAY_MS=500
+PROXY_QUOTA_COOLDOWN_MS=7200000
 ```
 
-Leave these alone for your first run unless you already know your upstream needs different limits.
+Any of the policy keys may be omitted: the runtime falls back to the defaults above instead of failing to start.
 
 ## Common Mistakes
 
-- Forgetting to fill `PRIMARY_PROVIDER_API_KEY`.
-- Pointing `PRIMARY_PROVIDER_BASE_URL` at a site root that does not serve `/v1/responses` and `/v1/models`.
-- Starting the proxy without loading the instance `.env` values.
-- Editing tracked `*.example` files instead of the gitignored `instances/proxy-11234/` runtime files.
-- Expecting `PORT` or `HOST` changes in `/admin` to take effect without restarting the process.
+- Leaving `fallback.json` without a channel, or listing a channel id under `models` that was never declared in `channels`.
+- Pointing a channel `base_url` at a host that lacks `/v1/messages`.
+- Starting without loading `instances/proxy-11234/.env`.
+- Editing tracked `*.example` files instead of local runtime files.
+- Keeping a deprecated key such as `PROXY_ENDPOINT_FAILURE_THRESHOLD` in `.env`: it is ignored with a warning, and the admin UI refuses to save a draft that still carries it.
+- Expecting `HOST` or `PORT` reloads to move the already-running listener without a restart.
 
 ## Next Steps
 
-- See `docs/examples.md` for more request patterns.
-- See `docs/configuration.md` for full config reference and recommended profiles.
-- See `docs/operations.md` for multi-instance layout and systemd deployment.
+- `docs/examples.md` shows request bodies for `cache_control`, tools, stream mode, and sanitized system text.
+- `docs/configuration.md` lists current runtime keys and defaults.
+- `docs/streaming-compatibility.md` explains Anthropic SSE handling and fallback boundaries.

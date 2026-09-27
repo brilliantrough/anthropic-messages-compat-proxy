@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
-import { getAvailablePort } from './_helpers.js';
+import { getAvailablePort, instanceEnvPath, writeRoutingConfig } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -64,6 +64,11 @@ async function main() {
   const fallbackConfigPath = path.join(tempDir, 'fallback.json');
   await writeFile(fallbackConfigPath, JSON.stringify({ fallback_api_config: [] }, null, 2), 'utf8');
 
+  const routingConfigPath = await writeRoutingConfig(tempDir, {
+    primary: { name: 'primary', baseUrl: `http://127.0.0.1:${primaryAddress.port}`, apiKey: 'test-key' },
+    legacyFallbackPath: fallbackConfigPath,
+  });
+
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
     cwd: workspaceRoot,
@@ -72,10 +77,9 @@ async function main() {
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
         INSTANCE_NAME: 'anthropic-proxy-stats-check',
-        PRIMARY_PROVIDER_NAME: 'primary',
-        PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
-        PRIMARY_PROVIDER_API_KEY: 'test-key',
-        FALLBACK_CONFIG_PATH: fallbackConfigPath,
+
+      PROXY_ENV_PATH: instanceEnvPath(tempDir),
+      FALLBACK_CONFIG_PATH: routingConfigPath,
         PROXY_SSE_FAILURE_DEBUG: '1',
         PROXY_SSE_FAILURE_DIR: path.join(tempDir, 'sse-failures'),
         PROXY_STREAM_MISSING_USAGE_DEBUG: '1',
@@ -112,10 +116,11 @@ async function main() {
     assert.ok(stats.instanceName, 'stats should have instanceName');
     assert.equal(stats.host, '127.0.0.1', 'stats should expose host');
     assert.equal(stats.port, proxyPort, 'stats should expose port');
-    assert.equal(stats.primaryProviderName, 'primary', 'stats should expose primaryProviderName');
-    assert.equal(stats.activeRequests, 0, 'stats should expose top-level activeRequests');
-    assert.equal(stats.fallbackConfigPath, fallbackConfigPath, 'stats should expose fallbackConfigPath');
-    assert.ok(Array.isArray(stats.fallbackNames), 'stats should expose fallbackNames');
+    assert.equal(stats.defaultModel, 'test-model', 'stats should expose the canonical default model');
+    const channels = stats.channels as Array<{ id?: string; name?: string }> | undefined;
+    assert.ok(channels?.some(channel => channel.id === 'primary' && channel.name === 'primary'), 'stats should expose configured channels');
+    assert.equal(stats.routingConfigPath, routingConfigPath, 'stats should expose routingConfigPath');
+    assert.equal((stats.stats as Record<string, unknown>).activeRequests, 0, 'nested stats should expose activeRequests');
     assert.equal(stats.sseFailureDebugEnabled, true, 'stats should expose sseFailureDebugEnabled');
     assert.equal(stats.streamMissingUsageDebugEnabled, true, 'stats should expose streamMissingUsageDebugEnabled');
     assert.equal(stats.fallbackOnRetryable4xx, true, 'stats should expose fallbackOnRetryable4xx');

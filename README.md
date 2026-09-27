@@ -2,18 +2,21 @@
 
 A TypeScript compatibility proxy for upstream providers that expose Anthropic-style `/v1/messages` and `/v1/models` endpoints.
 
-It is designed as a transparent Anthropic-to-Anthropic proxy: clients send Anthropic Messages API requests to this proxy, and the proxy forwards Anthropic Messages API requests upstream with compatibility normalization, model aliases, streaming passthrough, and safer default handling around gateway-added attribution text.
+It is designed as a transparent Anthropic-to-Anthropic proxy: clients send Anthropic Messages API requests to this proxy, and the proxy forwards Anthropic Messages API requests upstream with compatibility normalization, canonical model routing, ordered channel fallback, streaming passthrough, and safer default handling around gateway-added attribution text.
 
 This is not an official Anthropic project.
 
 ## What It Helps With
 
 - Proxy `POST /v1/messages` for JSON and streaming clients.
-- Proxy `GET /v1/models` with optional model alias exposure.
+- Proxy `GET /v1/models` through the selected model route.
+- Route each canonical model to an ordered channel list, with per-channel retry and ordered fallback.
+- Open a rolling-window breaker per channel, isolate quota exhaustion, and control channels manually from the monitor page.
+- Record every real upstream attempt with Anthropic input-split token accounting at `/admin/usage`, with a three-minute uptime band.
 - Preserve Anthropic Messages API request and response shapes.
 - Forward Anthropic SSE streams such as `message_start`, `content_block_delta`, `message_delta`, and `message_stop`.
 - Inject a default `anthropic-version` header when clients do not provide one.
-- Avoid forwarding client `x-api-key` values upstream; upstream auth comes from local proxy config.
+- Avoid forwarding client `x-api-key` values upstream; upstream auth comes from the channel that serves the request.
 - Strip Claude Code / Anthropic billing header text or dynamic `cch=...` fields from top-level `system` text so cacheable prompt prefixes stay stable across gateways.
 
 ## Requirements
@@ -30,20 +33,45 @@ npm install
 cp -r instances/example-11234 instances/proxy-11234
 cp instances/proxy-11234/.env.example instances/proxy-11234/.env
 cp instances/proxy-11234/fallback.json.example instances/proxy-11234/fallback.json
-cp instances/proxy-11234/model-map.json.example instances/proxy-11234/model-map.json
+chmod 600 instances/proxy-11234/fallback.json
 ```
 
-Edit `instances/proxy-11234/.env` and fill at least:
+Edit `instances/proxy-11234/fallback.json` and declare the channels and models this instance serves:
+
+```json
+{
+  "default_model": "claude-sonnet-4-5",
+  "channels": [
+    {
+      "id": "provider-a",
+      "name": "Provider A",
+      "base_url": "https://api.anthropic.com",
+      "api_key": "your_api_key_here"
+    }
+  ],
+  "models": {
+    "claude-sonnet-4-5": { "channel_ids": ["provider-a"] }
+  },
+  "aliases": {
+    "claude-latest": "claude-sonnet-4-5"
+  }
+}
+```
+
+`channels` holds the base URL and API key, `models` gives each canonical model an ordered channel list, and `aliases` resolve a client-facing name to one canonical model. Only configured models can be requested.
+
+`instances/proxy-11234/.env` keeps the listener and runtime paths:
 
 ```env
-PRIMARY_PROVIDER_NAME=anthropic-compatible-provider
-PRIMARY_PROVIDER_BASE_URL=https://api.anthropic.com
-PRIMARY_PROVIDER_API_KEY=your_api_key_here
-PRIMARY_PROVIDER_DEFAULT_MODEL=claude-sonnet-4-5
+PORT=11234
+HOST=0.0.0.0
+INSTANCE_NAME=anthropic-proxy-11234
+PROXY_ENV_PATH=./instances/proxy-11234/.env
+FALLBACK_CONFIG_PATH=./instances/proxy-11234/fallback.json
 ANTHROPIC_VERSION=2023-06-01
 ```
 
-Recommended runtime timeout / fallback settings:
+Recommended runtime timeout and policy settings:
 
 ```env
 PROXY_UPSTREAM_TIMEOUT_MS=30000
@@ -54,20 +82,23 @@ PROXY_STREAM_IDLE_TIMEOUT_MS=60000
 PROXY_TOTAL_REQUEST_TIMEOUT_MS=600000
 PROXY_MAX_CONCURRENT_REQUESTS=128
 PROXY_MAX_FALLBACK_TOTAL_MS=30000
-PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS=120000
-PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS=120000
-PROXY_ENDPOINT_AUTH_COOLDOWN_MS=1800000
-PROXY_ENDPOINT_FAILURE_THRESHOLD=1
-PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES=1
+PROXY_HEALTH_WINDOW_MS=180000
+PROXY_HEALTH_FAILURE_THRESHOLD=15
+PROXY_HEALTH_FAILURE_RATE_THRESHOLD=0.5
+PROXY_HEALTH_COOLDOWN_MS=600000
+PROXY_CHANNEL_MAX_ATTEMPTS=3
+PROXY_CHANNEL_RETRY_DELAY_MS=500
+PROXY_QUOTA_COOLDOWN_MS=7200000
+PROXY_USAGE_DB_PATH=./instances/proxy-11234/usage.sqlite
 ```
 
-Leave `PROXY_MAX_FALLBACK_ATTEMPTS` unset unless you intentionally want to override the default derived behavior. When omitted, the proxy derives it as `max(1, fallback provider count)`.
+Every policy key may be omitted; the runtime applies the defaults above.
 
 Build and start the proxy with that instance configuration loaded:
 
 ```bash
 npm run build
-env $(grep -v '^#' instances/proxy-11234/.env | xargs) npm run proxy:start
+node --env-file=instances/proxy-11234/.env dist/anthropic-proxy.js
 ```
 
 Check health:
@@ -99,22 +130,22 @@ curl -N http://127.0.0.1:11234/v1/messages \
 
 ## Model Aliases
 
-`model-map.json` can expose local aliases while sending provider model IDs upstream:
+The routing document can expose local aliases while sending the canonical model upstream:
 
 ```json
 {
-  "model_mappings": {
+  "aliases": {
     "public-claude": "claude-sonnet-4-5"
   }
 }
 ```
 
-If a client requests `public-claude`, the proxy forwards `claude-sonnet-4-5` upstream and rewrites successful JSON responses back to `public-claude`.
+If a client requests `public-claude`, the proxy forwards `claude-sonnet-4-5` upstream and echoes `public-claude` in successful JSON responses and in normalized stream `message_start` events.
 
 ## Anthropic Headers
 
 - `x-api-key` sent by clients is not forwarded upstream.
-- The upstream `x-api-key` comes from `PRIMARY_PROVIDER_API_KEY`.
+- The upstream `x-api-key` comes from the channel that serves the request.
 - `anthropic-version` is forwarded from the client when present; otherwise `ANTHROPIC_VERSION` is injected.
 - `anthropic-beta` is forwarded from the client when present; otherwise `ANTHROPIC_BETA` is used when configured.
 
@@ -139,7 +170,7 @@ npm run check
 npm run build
 ```
 
-## Runtime Timeout & Fallback Knobs
+## Runtime Timeout, Routing, And Health Knobs
 
 - `PROXY_UPSTREAM_TIMEOUT_MS` - connect timeout for streaming upstream requests, default `30000`
 - `PROXY_NON_STREAM_TIMEOUT_MS` - connect timeout for non-stream requests, default `300000`
@@ -148,19 +179,23 @@ npm run build
 - `PROXY_STREAM_IDLE_TIMEOUT_MS` - max idle gap between upstream stream chunks, default `60000`
 - `PROXY_TOTAL_REQUEST_TIMEOUT_MS` - total request lifetime cap, default `600000`
 - `PROXY_MAX_CONCURRENT_REQUESTS` - local active-request ceiling, default `128`
-- `PROXY_MAX_FALLBACK_ATTEMPTS` - max number of fallback endpoint tries per request; leave unset for the default `max(1, fallback provider count)` behavior, or set it explicitly to override
 - `PROXY_MAX_FALLBACK_TOTAL_MS` - total wall-clock fallback budget per request, default `30000`
-- `PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS` - cooldown after timeout-style failures, default `120000`
-- `PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS` - cooldown after invalid-response failures, default `120000`
-- `PROXY_ENDPOINT_AUTH_COOLDOWN_MS` - cooldown after retryable/auth-style upstream failures, default `1800000`
-- `PROXY_ENDPOINT_FAILURE_THRESHOLD` - failures needed before opening the circuit when the reason is not immediate-open, default `1`
-- `PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES` - concurrent half-open probe limit, default `1`
+- `PROXY_CHANNEL_MAX_ATTEMPTS` - attempts per request per channel including the first, default `3`
+- `PROXY_CHANNEL_RETRY_DELAY_MS` - delay between two attempts on the same channel, default `500`
+- `PROXY_HEALTH_WINDOW_MS` - rolling window for the shared channel counters, default `180000`
+- `PROXY_HEALTH_FAILURE_THRESHOLD` - failures in the window needed to open the breaker, default `15`
+- `PROXY_HEALTH_FAILURE_RATE_THRESHOLD` - failure rate that must be strictly exceeded, default `0.5`
+- `PROXY_HEALTH_COOLDOWN_MS` - breaker cooldown once both thresholds hold, default `600000`
+- `PROXY_QUOTA_COOLDOWN_MS` - quota-exhaustion cooldown, default `7200000`, capped at the next 00:02 Beijing time
+- `PROXY_USAGE_DB_PATH` - usage history database, default `usage.sqlite` in the instance directory
+
+Deprecated keys such as `PROXY_ENDPOINT_FAILURE_THRESHOLD` and `PROXY_MAX_FALLBACK_ATTEMPTS` are ignored with a startup warning. The admin config view marks them as stopped and refuses to save a draft that still carries them.
 
 ## Current Scope
 
-This current version implements a transparent Anthropic Messages proxy with JSON forwarding, model aliases, header normalization, top-level `system` billing-header cleanup, non-streaming fallback, stream fallback gating, `/v1/models`, `/healthz`, `/admin`, and `/admin/monitor`.
+This version implements a transparent Anthropic Messages proxy with JSON forwarding, canonical model routing, ordered channel fallback, per-channel retry, a rolling-window breaker with quota isolation and manual control, model aliases, header normalization, top-level `system` billing-header cleanup, `/v1/models`, `/healthz`, and the `/admin`, `/admin/monitor`, and `/admin/usage` pages.
 
-Depth parity with the Responses proxy is still evolving. The main remaining follow-up area is broader operational hardening and repeated-failure behavior beyond the current cooldown/circuit-breaker coverage.
+Usage history records every real upstream attempt with the Anthropic input-split accounting, and the uptime band samples the ordinary model routes every three minutes.
 
 ## Friendly Links
 

@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { instanceEnvPath, writeRoutingConfig } from './_helpers.js';
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -23,6 +26,7 @@ async function waitForHealthy(url: string) {
 }
 
 async function main() {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'anthropic-proxy-concurrency-'));
   const primary = createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/messages') {
       await delay(2000);
@@ -59,6 +63,10 @@ async function main() {
 
   const proxyPort = primaryAddress.port + 1;
 
+  const routingConfigPath = await writeRoutingConfig(tempDir, {
+    primary: { name: 'primary', baseUrl: `http://127.0.0.1:${primaryAddress.port}`, apiKey: 'test-key' },
+  });
+
   const tsxCliPath = require.resolve('tsx/cli');
   const proxy = spawn(process.execPath, [tsxCliPath, 'src/anthropic-proxy.ts'], {
     cwd: workspaceRoot,
@@ -67,9 +75,9 @@ async function main() {
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
       INSTANCE_NAME: 'anthropic-proxy-concurrency-check',
-      PRIMARY_PROVIDER_NAME: 'primary',
-      PRIMARY_PROVIDER_BASE_URL: `http://127.0.0.1:${primaryAddress.port}`,
-      PRIMARY_PROVIDER_API_KEY: 'test-key',
+
+      PROXY_ENV_PATH: instanceEnvPath(tempDir),
+      FALLBACK_CONFIG_PATH: routingConfigPath,
       PROXY_MAX_CONCURRENT_REQUESTS: '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -127,6 +135,7 @@ async function main() {
     ]);
     primary.close();
     await once(primary, 'close');
+    await rm(tempDir, { recursive: true, force: true });
   }
 
   if (stderr.length > 0) {

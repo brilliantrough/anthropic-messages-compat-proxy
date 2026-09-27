@@ -2,36 +2,15 @@
 
 [English](../streaming-compatibility.md) | [中文](./streaming-compatibility.md)
 
-本文说明代理如何处理实现 OpenAI Responses API 的上游 provider 的流式返回，包括：
+本文说明代理如何处理上游 provider 返回的 Anthropic Messages SSE。
 
-- SSE 线协议格式
-- 请求结构
-- `normalized` / `raw` 两种流模式
-- 文本识别事件
-- 多阶段超时
-- missing usage 处理
-- 调试捕获注意事项
+代理期望的 Anthropic stream events 包括 `message_start`、`content_block_start`、`content_block_delta`、`content_block_stop`、`message_delta`、`message_stop`、`ping` 和 `error`。
 
-所有示例都使用通用占位值，不包含真实 provider 名称、本地路径或事故编号。
+## SSE Wire Format
 
----
+流式客户端调用 `POST /v1/messages`，并在请求体中设置 `stream: true`，或发送 `Accept: text/event-stream`。
 
-## 目录
-
-- [SSE 内容类型与事件格式](#sse-内容类型与事件格式)
-- [网络 chunk 不是完整 JSON](#网络-chunk-不是完整-json)
-- [上游 JSON 请求结构](#上游-json-请求结构)
-- [流模式normalized-和-raw](#流模式normalized-和-raw)
-- [哪些事件算作识别到文本](#哪些事件算作识别到文本)
-- [超时阶段](#超时阶段)
-- [Missing Usage](#missing-usage)
-- [调试捕获警告](#调试捕获警告)
-
----
-
-## SSE 内容类型与事件格式
-
-代理向客户端返回流式结果时，会使用这些响应头：
+代理输出：
 
 ```text
 content-type: text/event-stream; charset=utf-8
@@ -39,301 +18,205 @@ cache-control: no-cache
 connection: keep-alive
 ```
 
-每个 SSE 事件由一行 `event:` 和一行或多行 `data:` 组成，并以空行结尾：
+每个事件使用标准 SSE framing：
 
 ```text
-event: response.output_text.delta
-data: {"type":"response.output_text.delta","delta":"Hello"}
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"public-claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":4}}}
 
-event: response.output_text.delta
-data: {"type":"response.output_text.delta","delta":" world"}
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
 
-event: response.completed
-data: {"type":"response.completed","response":{...}}
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}
+
+event: message_stop
+data: {"type":"message_stop"}
 ```
 
-代理还会设置 CORS 头：
+网络 chunk 不是 event 边界。代理会缓冲收到的文本，直到拿到完整的空行分隔 SSE block，再解析该 event。
 
-- `access-control-allow-origin: *`
-- `POST, OPTIONS`
-- `Content-Type, Authorization`
+## Request Shape
 
-### 错误事件
-
-如果 SSE 头已经发出之后，代理遇到超时或内部错误，会在流内发送一个终止性的 `error` 事件：
-
-```text
-event: error
-data: {"type":"error","code":"server_error","message":"Upstream response stream did not produce text output within 12000ms","param":null,"sequence_number":5}
-```
-
-`sequence_number` 如果存在，表示这个错误大概发生在流中的哪个位置。
-
----
-
-## 网络 chunk 不是完整 JSON
-
-这是实现里最容易踩坑的点之一：上游返回的数据是网络 chunk，不是“一次 read 就是一条完整 JSON 事件”。
-
-一个 TCP frame 或 HTTP/2 DATA frame 可能包含：
-
-- 半条 SSE 事件（JSON 中途被截断）
-- 多条完整 SSE 事件拼在一起
-- 一个跨 chunk 的 `data:` 行
-
-因此代理会先把文本缓冲起来，扫描 SSE 事件分隔符（`
-
-` 或 `\r\n\r\n`），只有拿到完整事件块后才解析 JSON。
-
-### 这意味着
-
-- 不能把每次 `ReadableStream.read()` 返回的 chunk 直接当作一条完整事件解析
-- 代理内部会维护一个 `pending` buffer
-- 流结束后，如果还有尾部未处理的残余，也会再尝试 flush 一次
-
-这其实就是 SSE 规范本身要求的处理方式，但在兼容各类 provider 时非常关键。
-
----
-
-## 上游 JSON 请求结构
-
-代理向上游 `/v1/responses` 发送的 POST JSON，大致会被规范化成这样：
+上游请求保持 Anthropic-native：
 
 ```json
 {
-  "model": "my-model-v2",
-  "instructions": "You are a helpful assistant.",
-  "input": [
+  "model": "claude-sonnet-4-5",
+  "max_tokens": 256,
+  "stream": true,
+  "system": [
     {
-      "type": "message",
+      "type": "text",
+      "text": "Use the project glossary.",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "messages": [
+    {
       "role": "user",
       "content": [
         {
-          "type": "input_text",
-          "text": "Hello"
+          "type": "text",
+          "text": "Explain streaming fallback."
         }
       ]
     }
-  ],
-  "stream": true,
-  "store": false,
-  "prompt_cache_retention": "in_memory",
-  "prompt_cache_key": "stable-prefix-key"
+  ]
 }
 ```
 
-### 关键字段
+代理可能映射 `model`，清理顶层 `system` billing 文本，并为流式客户端强制 `stream: true`。
 
-| 字段 | 说明 |
+它会保留原生 Anthropic 字段，例如 `cache_control`、`tools`、`tool_choice`、content arrays、thinking blocks 和 tool results。
+
+`proxy_stream_mode` 是代理本地字段，会在转发上游前移除。
+
+## Stream Modes
+
+`normalized` 是默认值。
+
+在 normalized 模式下，代理会解析 events，缓冲 metadata 直到可用输出出现，并把 `message_start.message.model` 改为客户端请求的模型别名。
+
+在 raw 模式下，代理在相同的可用输出 commit gate 之后，以最少改动转发上游 SSE blocks。Raw 模式会保留 event 中的上游模型。
+
+选择优先级：
+
+1. Request body `proxy_stream_mode`
+2. Request header `x-proxy-stream-mode`
+3. Environment variable `PROXY_STREAM_MODE`
+4. Default `normalized`
+
+## Usable Output
+
+可用输出是安全 pre-commit fallback 与已提交客户端输出之间的边界。
+
+代理把这些 Anthropic events 视为可用输出：
+
+| Event | Usable condition |
 | --- | --- |
-| `model` | 可能会先通过 model mapping 从客户端模型名改写成上游真实模型名 |
-| `instructions` | 可能按代理设置被覆盖、清空或原样透传 |
-| `input` | 字符串输入会被包装成标准 `message` 结构；默认会把 `system` 角色转换成 `developer` |
-| `stream` | 由客户端请求决定为 `true` 或 `false` |
-| `store` | 如果启用了 `force_store_false`，会被设置成 `false` |
-| `prompt_cache_retention` | 客户端传入则保留；未传则可能由代理注入；支持 `in_memory` 和 `24h` |
-| `prompt_cache_key` | 客户端传入则保留；未传则可能由代理注入；必须稳定，不能带随机值 |
+| `content_block_delta` | `delta.type` is `text_delta` and `delta.text` is nonempty. |
+| `content_block_delta` | `delta.type` is `thinking_delta` and `delta.thinking` is nonempty. |
+| `content_block_delta` | `delta.type` is `signature_delta` and `delta.signature` is nonempty. |
+| `content_block_delta` | `delta.type` is `input_json_delta` and `delta.partial_json` is a string. |
+| `content_block_start` | `content_block.type` is `tool_use`. |
 
-### 代理内部字段
+Metadata-only events 不会自行提交 fallback，例如 `message_start`、empty text starts、`ping` 和 `message_stop`。
 
-请求体中的 `proxy_stream_mode` 不会发给上游，它只在代理内部用于选择流模式。
+## Fallback Boundary
 
----
+Fallback 只允许在可用输出写给客户端之前发生。
 
-## 流模式：`normalized` 和 `raw`
+Commit 前，代理可以为 connect errors、connect timeouts、body timeouts、upstream 5xx、retryable 4xx 和 compatibility 4xx 尝试下一个 endpoint。
 
-代理支持两种流模式，用来决定如何处理中间的上游 SSE 事件。
+在仍能安全切换的路径上，代理也可以为 invalid JSON、empty output、no usable stream output 和 missing usage 切换 endpoint。
 
-### `normalized`（默认）
+Commit 后，代理不再切换 providers。如果 stream 在可用输出后 timeout 或 error，客户端会留在当前响应路径上。
 
-`normalized` 模式会：
-
-1. 解析每条上游 SSE 事件的 JSON payload
-2. 对 payload 做 Responses 风格的规范化
-3. 在识别到真正的 assistant 文本前，缓冲 pre-text 元数据事件
-4. 再把规范化后的 payload 重新序列化成 JSON 写回 `data:`
-
-规范化包括：
-
-- 若存在 `response`，把 `response.object` 设为 `"response"`
-- `response.status` 缺失时默认补成 `"completed"`
-- 确保 `response.output` 一定是数组
-- 将客户端请求时的模型名回填到 `model` 与 `response.model`
-- 如果消息 item 缺少 role，则默认补成 `assistant`
-
-示例：
+对于代理检测到的 post-commit timeout 或 read failure，如果响应仍可写，代理会写入终止性的 Anthropic error event：
 
 ```text
-event: response.output_text.delta
-data: {"type":"response.output_text.delta","delta":"Hello","item":{"type":"message","role":"assistant"}}
+event: error
+data: {"type":"error","error":{"type":"server_error","message":"Stream timeout"}}
 ```
 
-### `raw`
+## Non-Stream SSE Synthesis
 
-`raw` 模式下，代理会尽量直接把上游 SSE 字节流转发给客户端：
+有些上游即使客户端请求 JSON，也会返回 `text/event-stream`。
 
-1. 不重新解析再序列化 payload
-2. 不在文本识别前缓冲事件
-3. 客户端看到的更接近上游原始事件形状
-4. 代理内部仍然会做 usage 提取和文本检测，用于 fallback 判定
+对于非流式客户端，代理会读取 SSE body，解析 Anthropic events，并在存在可用输出时合成 Messages JSON response。
 
-如果上游 content-type 不标准，代理退化成文本 probe 路径时，`raw` 模式也可能输出解析过的 SSE，而不是完全原始字节。
+Text deltas 会追加到最终 `text` content blocks。
 
-### 流模式选择优先级
+Thinking deltas 会追加到 `thinking` blocks。`signature_delta` 会设置 block signature。
 
-优先级从高到低：
+Tool calls 从 `tool_use` content blocks 开始。`input_json_delta.partial_json` chunks 会拼接，并在 `content_block_stop` 时解析到最终 `tool_use.input` 对象。
 
-1. 请求体中的 `proxy_stream_mode`
-2. 请求头中的 `X-Proxy-Stream-Mode`
-3. 环境变量 `PROXY_STREAM_MODE`
+`message_delta` 提供 `stop_reason`、`stop_sequence` 和 usage fields。
 
----
+如果合成成功，响应 model 会恢复为客户端请求的模型别名。
 
-## 哪些事件算作识别到文本
-
-代理会持续观察 SSE payload，判断是否已经真正产生 assistant 文本。这会影响：
-
-- pre-text 缓冲何时 flush
-- `first-text` 超时何时停止计时
-- 在部分流异常后是否还能安全 fallback
-
-### 会被算作“识别到文本”的事件
-
-| 事件类型 | 条件 | 文本来源 |
-| --- | --- | --- |
-| `response.output_text.delta` | `payload.delta` 是字符串 | `delta` 长度 |
-| `response.output_text.done` | `payload.text` 是字符串 | `text` 长度 |
-| `response.content_part.done` | `payload.part.type === "output_text"` 且 `payload.part.text` 是字符串 | `part.text` 长度 |
-| `response.completed` | `response.output` 中存在 `output_text` part | 累加文本长度 |
-| `response.output_item.done` | `response` 或 `item` 的 `output` 中存在 `output_text` part | 累加文本长度 |
-
-此外，如果代理提取出了 usage 并且 `outputTokens > 0`，也会把它视为一个“避免误判为空流”的信号。
-
-### 不算作识别到文本的情况
-
-- `response.created`
-- `response.in_progress`
-- `response.function_call_arguments.delta`
-- 文本字段缺失、为空，或不是字符串
-- 未知或非标准事件类型
-
----
-
-## 超时阶段
-
-流式请求中，代理会对多个阶段分别计时：
+## Tool Use Stream Example
 
 ```text
-Client request ──► [connect] ──► [first-byte] ──► [first-text] ──► [idle gaps] ──► Stream end
-                  │             │                │                │
-                  │             │                │                └─ stream-idle timeout
-                  │             │                └─ first-text timeout
-                  │             └─ first-byte timeout
-                  └─ connect timeout
-                  ────────────────────────────────────────────────────
-                                     total timeout covers everything
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"location\":"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" \"SF\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
 ```
 
-### 各阶段说明
+第一个 `tool_use` block start 已经是可用输出。因此该 block 发送后，provider switching 不再允许。
 
-| 阶段 | 对应设置 | 默认值 | 触发条件 |
-| --- | --- | --- | --- |
-| connect | `PROXY_UPSTREAM_TIMEOUT_MS` | 8000ms | 上游迟迟不返回初始 HTTP headers |
-| first-byte | `PROXY_FIRST_BYTE_TIMEOUT_MS` | 8000ms | 上游 headers 已返回，但响应体迟迟没有首个 byte/chunk |
-| first-text | `PROXY_FIRST_TEXT_TIMEOUT_MS` | 0（关闭） | 迟迟没有识别到 assistant 文本 |
-| idle | `PROXY_STREAM_IDLE_TIMEOUT_MS` | 15000ms | 连续两个 body chunk 之间空闲太久 |
-| total | `PROXY_TOTAL_REQUEST_TIMEOUT_MS` | 45000ms | 从代理视角看，整个请求生命周期超过上限 |
+## Usage 与 Cache Fields
 
-### 超时与 fallback 的关系
+代理从 `message_start.message.usage`、`message_delta.usage`，以及 synthesized 或 direct JSON `usage` objects 中提取 usage。
 
-超时发生时：
+Anthropic fields 在内部映射为：
 
-1. 如果客户端尚未收到任何 SSE 数据，代理仍可能尝试 fallback
-2. 如果 SSE headers 已经发出，就只能在流内发 `error` 事件，不能再改 HTTP 状态码
-3. 如果客户端已经收到了文本内容，则后续即便超时，也不会再 fallback，因为客户端已经消费了部分输出
-
-### 超时错误消息
-
-| 阶段 | 错误消息模式 |
+| Anthropic field | Internal stats field |
 | --- | --- |
-| connect | `Upstream did not produce an initial response within Nms` |
-| first-byte | `Upstream response body did not produce a first chunk within Nms` |
-| first-text | `Upstream response stream did not produce text output within Nms` |
-| idle | `Upstream response stream was idle for more than Nms` |
-| total | `Upstream request exceeded total lifetime limit of Nms` |
+| `input_tokens` | `inputTokens` |
+| `output_tokens` | `outputTokens` |
+| `cache_creation_input_tokens` | `cacheCreationInputTokens` |
+| `cache_read_input_tokens` | `cacheReadInputTokens` |
 
----
+Usage 可以在 stream 中出现多次。代理会在字段到达时合并已观察到的 usage fields。
 
-## Missing Usage
+如果完成的 stream 产生了可用输出，但没有可提取 usage，代理会记录 `stream_missing_usage` 用于诊断。输出已提交后不会切换 provider。
 
-代理会从 SSE 事件中尝试提取 usage 数据，通常来自带有 `response.usage` 的事件（例如 `response.completed`）。
+如果非流式 JSON 响应有可用内容但没有 usage，且 fallback 仍可用，代理可能在返回最终响应前尝试另一个 endpoint。
 
-### 什么时候会被视为 missing usage
+## Timeout Defaults
 
-以下情况会被标记为 missing usage：
+有效默认值是：
 
-- 流完整结束，但没有任何事件带出可提取的 usage
-- 流在到达 `response.completed` 前因为超时或客户端断开而中断
-
-### 可提取的 usage 字段
-
-| 字段 | 来源 |
+| Timeout | Default |
 | --- | --- |
-| `responseId` | `response.id` |
-| `model` | `response.model` |
-| `inputTokens` | `usage.input_tokens` |
-| `outputTokens` | `usage.output_tokens` |
-| `totalTokens` | `usage.total_tokens` |
-| `cachedInputTokens` | `usage.input_tokens_details.cached_tokens` |
-| `reasoningTokens` | `usage.output_tokens_details.reasoning_tokens` |
+| `PROXY_UPSTREAM_TIMEOUT_MS` | `30000` |
+| `PROXY_NON_STREAM_TIMEOUT_MS` | `300000` |
+| `PROXY_FIRST_BYTE_TIMEOUT_MS` | `30000` |
+| `PROXY_FIRST_TEXT_TIMEOUT_MS` | `12000` |
+| `PROXY_STREAM_IDLE_TIMEOUT_MS` | `60000` |
+| `PROXY_TOTAL_REQUEST_TIMEOUT_MS` | `600000` |
 
-### Missing usage 与 fallback
+`PROXY_UPSTREAM_TIMEOUT_MS` 覆盖初始流式上游 fetch。
 
-对于流式响应来说，只有在客户端还没看到文本内容之前，missing usage 后再 fallback 才是安全的。如果流里已经产出了可识别文本，但最终没有 usage，代理会记录这个情况，但不会 fallback，因为客户端已经消费了输出。
+`PROXY_NON_STREAM_TIMEOUT_MS` 覆盖初始非流式上游 fetch。
 
-非流式 JSON 响应没有这种“已经部分输出”的约束，因此在 usage 缺失时仍可能走 fallback 逻辑。
+`PROXY_FIRST_BYTE_TIMEOUT_MS` 覆盖等待第一个 body chunk。
 
-### Missing usage 与统计
+`PROXY_FIRST_TEXT_TIMEOUT_MS` 覆盖 commit 前等待可用 stream output。
 
-即便某一条流缺失 usage，代理仍然会在内部计数中记录这次请求。`/admin/stats` 返回的 `usageResponses`、`usageInputTokens`、`usageOutputTokens` 只统计那些真正成功提取到 usage 的流。
+`PROXY_STREAM_IDLE_TIMEOUT_MS` 覆盖 stream chunks 之间的空闲间隔。
 
----
+`PROXY_TOTAL_REQUEST_TIMEOUT_MS` 覆盖完整请求生命周期。
 
-## 调试捕获警告
+## Debug Captures
 
-在某些失败场景下，代理会把调试信息写入磁盘。这些文件包含敏感数据，例如：
+SSE failure capture 由以下设置控制：
 
-- 完整 prompt
-- 模型输出
-- provider 特有的错误内容
+```env
+PROXY_SSE_FAILURE_DEBUG=0
+PROXY_SSE_FAILURE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/sse-failures
+```
 
-### SSE failure capture
+Missing-usage stream capture 由以下设置控制：
 
-如果代理收到的 SSE 无法重建为合法响应对象，并且启用了 `PROXY_SSE_FAILURE_DEBUG`，就可能写出：
+```env
+PROXY_STREAM_MISSING_USAGE_DEBUG=0
+PROXY_STREAM_MISSING_USAGE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/stream/missing-usage
+```
 
-- 一个 `.json` 元数据文件：请求 ID、上游状态码、content type、时间戳
-- 一个 `.sse.txt` 原始文本文件：完整上游 SSE 文本
-
-### Stream missing-usage capture
-
-如果流结束后没有提取到 usage，并且启用了 `PROXY_STREAM_MISSING_USAGE_DEBUG`，就可能写出：
-
-- 一个 `.json` 元数据文件：请求 ID、状态码、stream mode、chunk 数、字节数、事件数、时间戳
-- 一个 `.sse.txt` 文件：完整收集到的上游文本
-
-### 安全警告
-
-1. 永远不要提交这些 capture 输出
-2. 默认保持 debug capture 关闭，只在排障期间短时间开启
-3. capture 文件里可能包含完整 prompt 与响应
-4. 需要定期清理，否则既占磁盘又带来数据暴露风险
-5. capture 目录只应允许具备相应权限的运维人员访问
-
-### 相关配置
-
-| 设置 | 默认值 | 作用 |
-| --- | --- | --- |
-| `PROXY_SSE_FAILURE_DEBUG` | `0` | 开启 SSE failure 调试捕获 |
-| `PROXY_SSE_FAILURE_DIR` | `captures/<instance>/sse-failures` | SSE failure 输出目录 |
-| `PROXY_STREAM_MISSING_USAGE_DEBUG` | `0` | 开启 missing-usage 调试捕获 |
-| `PROXY_STREAM_MISSING_USAGE_DIR` | `captures/<instance>/stream/missing-usage` | missing-usage 输出目录 |
+Capture files 可能包含 prompts、response text、tool data、provider errors 和 token usage。只在本地或受保护的 incident work 中开启。

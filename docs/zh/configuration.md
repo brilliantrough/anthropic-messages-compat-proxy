@@ -2,293 +2,201 @@
 
 [English](../configuration.md) | [中文](./configuration.md)
 
-代理会从环境变量读取标量运行参数，从 JSON 文件读取 fallback 与 model mapping 这类结构化配置。
+Anthropic Messages 代理从 `.env` 读取标量设置，从同目录的 `fallback.json` 读取路由文档。
 
-建议按两步阅读：
+标量负责监听、超时、滑动窗口策略与调试开关；路由文档独占渠道、canonical model、alias 与默认模型。除此之外没有第二个地方决定请求去向。
 
-1. 先填必需字段，把服务跑起来
-2. 再根据上游 provider 的行为调整推荐参数
-
-## 必需字段
-
-要调用上游 provider，最少需要下面这些变量：
+## Anthropic Headers
 
 ```env
-PRIMARY_PROVIDER_NAME=primary-provider
-PRIMARY_PROVIDER_BASE_URL=https://provider.example
-PRIMARY_PROVIDER_API_KEY=your_api_key_here
+ANTHROPIC_VERSION=2023-06-01
+ANTHROPIC_BETA=
 ```
 
-代理会拼接并调用：
+`ANTHROPIC_VERSION` 在客户端未发送时补上出站 `anthropic-version`，代码默认值与示例值都是 `2023-06-01`。
 
-- `PRIMARY_PROVIDER_BASE_URL + /v1/responses`
-- `PRIMARY_PROVIDER_BASE_URL + /v1/models`
+`ANTHROPIC_BETA` 只在客户端未发送且本值非空时补上出站 `anthropic-beta`。
 
-如果这个 base URL 本身不提供这两个端点，代理就无法正常工作。
+客户端的 `x-api-key` 永不转发到上游，出站密钥始终来自实际服务该请求的渠道。
 
-## 大多数人会改的常用字段
+## 实例文件
+
+每个实例把运行文件放在 `instances/<instance-name>/` 下：
 
 ```env
-PRIMARY_PROVIDER_DEFAULT_MODEL=my-model-v2
 PORT=11234
 HOST=0.0.0.0
-INSTANCE_NAME=proxy-11234
+INSTANCE_NAME=anthropic-proxy-11234
 PROXY_ENV_PATH=./instances/proxy-11234/.env
 FALLBACK_CONFIG_PATH=./instances/proxy-11234/fallback.json
-MODEL_MAP_PATH=./instances/proxy-11234/model-map.json
 ```
 
-- `PRIMARY_PROVIDER_DEFAULT_MODEL`：便于测试时使用的默认模型名
-- `PORT` / `HOST`：监听地址
-- `INSTANCE_NAME`：日志、管理后台、captures 中使用的逻辑实例名
-- `PROXY_ENV_PATH`：告诉 `/admin` 后台该读写哪个 `.env`
-- `FALLBACK_CONFIG_PATH` / `MODEL_MAP_PATH`：通常应指向 gitignored 的运行时文件，而不是仓库里的 `*.example`
+代码默认值为 `PORT=11234`、`HOST=0.0.0.0`、`INSTANCE_NAME=anthropic-proxy-${PORT}`。
 
-仓库自带的 example 配置保留 `HOST=0.0.0.0`，这样同一套运行时文件也可以直接用于 Docker。若只是本机首次试跑且不希望 API 对局域网开放，可改成 `HOST=127.0.0.1`。
+`PROXY_ENV_PATH` 在启动时读取以创建 runtime config store，改动需要重启进程。
 
-### 需要重启才生效的字段
+`FALLBACK_CONFIG_PATH` 默认指向实例 `.env` 旁的 `fallback.json`。Usage 数据库默认是同目录的 `usage.sqlite`，可用 `PROXY_USAGE_DB_PATH` 覆盖。
 
-`PORT` 或 `HOST` 改动后，runtime reload 会检测到，但仍然需要完整重启进程才会真正生效。管理后台会把这些字段列在 `restartRequiredFields` 中，并显示重启提示。
+`MODEL_MAP_PATH` 已不再读取，alias 一律来自路由文档；该 key 仍存在时启动会打印警告。
 
-`PROXY_ENV_PATH` 同样需要重启，因为它只在启动时读取一次。
+`fallback.json` 及其备份包含凭据，文件权限保持 `0600`。
 
-## 进阶运行参数
+## 路由文档
 
-第一次跑通时，大多数人不需要修改这一节。
-
-### 运行时参考表
-
-| 变量 | 默认值 | 作用 |
-| --- | --- | --- |
-| `PORT` | `11234` | 监听端口 |
-| `HOST` | `0.0.0.0` | 监听地址。若只是本机首次试跑且不走 Docker，可改成 `127.0.0.1` |
-| `INSTANCE_NAME` | `responses-proxy-${PORT}` | 日志、captures、admin 中显示的实例名 |
-| `PROXY_ENV_PATH` | `.env` | 启动和 admin 编辑时使用的 `.env` 路径 |
-| `PROXY_ADMIN_ALLOW_HOST` | `0` | 显式开启时允许非 localhost 访问 `/admin`；此时应确保端口只暴露在受信网络内 |
-| `FALLBACK_CONFIG_PATH` | `config.json` | fallback provider JSON 路径 |
-| `MODEL_MAP_PATH` | `model-map.json` | 模型映射 JSON 路径 |
-| `PROXY_MAX_CONCURRENT_REQUESTS` | `512` | 最大并发请求数 |
-| `PROXY_MAX_CACHED_RESPONSES` | `200` | 缓存响应条目上限 |
-| `PROXY_FORCE_STORE_FALSE` | `0` | 必要时向上游注入 `store: false` |
-
-仓库中的 `instances/example-*` 是模板。真实部署请复制到 gitignored 的运行时目录，例如 `instances/proxy-11234/.env`、`instances/proxy-11234/fallback.json`、`instances/proxy-11234/model-map.json`。
-
-`PROXY_ADMIN_ALLOW_HOST=1` 主要用于 Docker 场景：服务发布到宿主机 `127.0.0.1`，同时希望宿主机浏览器访问 `/admin`。开启后，非 localhost 的 `/admin` 请求也会被接受，因此要继续保持端口只绑定在受信主机上，或自行加一层外部保护。
-
-### 超时参数
-
-代码默认值：
-
-| 变量 | 默认值 | 作用 |
-| --- | --- | --- |
-| `PROXY_UPSTREAM_TIMEOUT_MS` | `8000` | 等待上游返回初始响应头 |
-| `PROXY_NON_STREAM_TIMEOUT_MS` | `20000` | 非流式请求整体超时 |
-| `PROXY_FIRST_BYTE_TIMEOUT_MS` | `8000` | 等待响应体首个字节 |
-| `PROXY_FIRST_TEXT_TIMEOUT_MS` | `0` | 等待识别到首段文本；`0` 表示关闭这一层保护 |
-| `PROXY_STREAM_IDLE_TIMEOUT_MS` | `15000` | 流式响应 chunk 间最大空闲间隔 |
-| `PROXY_TOTAL_REQUEST_TIMEOUT_MS` | `45000` | 整个请求生命周期硬上限 |
-| `PROXY_MAX_FALLBACK_ATTEMPTS` | fallback endpoint 数量，最少 `1` | 最多尝试几个 fallback 端点 |
-| `PROXY_MAX_FALLBACK_TOTAL_MS` | `30000` | fallback 总耗时预算 |
-
-### 推荐配置档位
-
-#### 本地开发
-
-适合单机快速联调：
-
-```env
-PROXY_STREAM_MODE=normalized
-PROXY_MAX_CONCURRENT_REQUESTS=32
-PROXY_MAX_CACHED_RESPONSES=50
-```
-
-#### 通用稳定代理
-
-适合大多数公开使用场景：
-
-```env
-PROXY_UPSTREAM_TIMEOUT_MS=50000
-PROXY_NON_STREAM_TIMEOUT_MS=240000
-PROXY_FIRST_BYTE_TIMEOUT_MS=40000
-PROXY_FIRST_TEXT_TIMEOUT_MS=120000
-PROXY_STREAM_IDLE_TIMEOUT_MS=70000
-PROXY_TOTAL_REQUEST_TIMEOUT_MS=700000
-PROXY_MAX_FALLBACK_TOTAL_MS=480000
-PROXY_MAX_CONCURRENT_REQUESTS=128
-PROXY_MAX_CACHED_RESPONSES=200
-```
-
-#### 长流式输出
-
-适合生成内容很长、chunk 间停顿明显的 provider：
-
-```env
-PROXY_FIRST_TEXT_TIMEOUT_MS=120000
-PROXY_STREAM_IDLE_TIMEOUT_MS=70000
-PROXY_TOTAL_REQUEST_TIMEOUT_MS=700000
-```
-
-如果你的上游 provider 首字节慢、首段文本慢，或者流式间隔容易长时间空闲，就需要把这些值调大。如果你更倾向“快速失败并尽快 fallback”，则可以调小。
-
-始终建议保持：
-
-- `PROXY_TOTAL_REQUEST_TIMEOUT_MS > PROXY_MAX_FALLBACK_TOTAL_MS`
-
-这样即便 fallback 全部耗尽，也还能返回一个可控的失败结果。
-
-示例模板当前使用的稳定起步值：
-
-```env
-PROXY_UPSTREAM_TIMEOUT_MS=50000
-PROXY_NON_STREAM_TIMEOUT_MS=240000
-PROXY_FIRST_BYTE_TIMEOUT_MS=40000
-PROXY_FIRST_TEXT_TIMEOUT_MS=120000
-PROXY_STREAM_IDLE_TIMEOUT_MS=70000
-PROXY_TOTAL_REQUEST_TIMEOUT_MS=700000
-PROXY_MAX_FALLBACK_TOTAL_MS=480000
-```
-
-### 流模式
-
-```env
-PROXY_STREAM_MODE=normalized
-```
-
-支持值：
-
-- `normalized`：解析上游 SSE，规范化为 Responses 风格事件，并在识别到文本前缓冲元数据事件
-- `raw`：尽量原样透传上游 SSE，减少代理侧解释
-
-客户端也可以通过以下方式覆盖默认流模式：
-
-- 请求体中的 `proxy_stream_mode`
-- 请求头中的 `X-Proxy-Stream-Mode`
-
-### Fallback 策略与熔断相关参数
-
-```env
-PROXY_FALLBACK_ON_RETRYABLE_4XX=1
-PROXY_FALLBACK_ON_COMPAT_4XX=1
-PROXY_FALLBACK_COMPAT_PATTERNS=model not found,unsupported model,store must be false
-PROXY_NO_FALLBACK_CLIENT_ERROR_PATTERNS=maximum context length,input too large
-PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS=120000
-PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS=120000
-PROXY_ENDPOINT_AUTH_COOLDOWN_MS=1800000
-PROXY_ENDPOINT_FAILURE_THRESHOLD=1
-PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES=1
-```
-
-这组参数决定：
-
-- 哪些上游错误会触发 fallback
-- 某个 endpoint 失败后要冷却多久
-- 半开状态最多允许多少次探测
-
-### 请求规范化
-
-```env
-PROXY_CONVERT_SYSTEM_TO_DEVELOPER=1
-PROXY_CLEAR_DEVELOPER_CONTENT=0
-PROXY_CLEAR_SYSTEM_CONTENT=0
-PROXY_CLEAR_INSTRUCTIONS=0
-PROXY_OVERRIDE_INSTRUCTIONS_TEXT=
-PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line
-```
-
-只有当某些 provider 需要额外兼容处理时才建议改这里。默认会启用 `PROXY_CONVERT_SYSTEM_TO_DEVELOPER`。
-
-`PROXY_CLAUDE_BILLING_HEADER_MODE` 用于处理 Claude Code / Anthropic attribution 行经过其他网关转换后落入 OpenAI Responses `instructions` 或 system/developer 文本块的情况：
-
-- `strip_line`：默认值。删除整行 `x-anthropic-billing-header: ...`，让 prompt 前缀保持稳定，利于缓存命中。
-- `strip_cch`：保留 billing header 行，只删除动态的 `cch=...` 字段。
-
-这个设置不会清理 user role 内容，用户实际输入中的同名文本会保持原样。
-
-## fallback provider 配置
-
-更推荐使用 `api_key_env`，把密钥保存在 env 文件中：
+`fallback.json` 是渠道、canonical model、alias 与默认模型的唯一来源：
 
 ```json
 {
-  "fallback_api_config": [
+  "default_model": "claude-sonnet-4-5",
+  "channels": [
     {
-      "name": "fallback-a",
-      "base_url": "https://fallback-a.example",
-      "api_key_env": "FALLBACK_A_API_KEY"
+      "id": "provider-a",
+      "name": "Provider A",
+      "base_url": "https://provider-a.example",
+      "api_key": "replace-me"
     }
-  ]
-}
-```
-
-## 模型映射
-
-模型映射会改写发给上游的真实模型名，同时尽量保留客户端请求时的模型别名：
-
-```json
-{
-  "model_mappings": {
-    "public-alias-model": "my-model-v2"
+  ],
+  "models": {
+    "claude-sonnet-4-5": { "channel_ids": ["provider-a"] }
+  },
+  "aliases": {
+    "claude-latest": "claude-sonnet-4-5"
   }
 }
 ```
 
-## 配置文件路径与 admin 编辑
+`channels` 保存 inline 凭据，以及可选的显示名 `name` 和可选 `disable_cooldown`。
 
-代理会根据环境变量定位三类配置文件：
+`models` 为每个 canonical model 指定有序渠道列表，顺序即 fallback 优先级，也正是管理页拖拽保存的顺序。
 
-| 文件 | 默认路径 | 环境变量 | 是否可通过 admin 编辑 |
-| --- | --- | --- | --- |
-| `.env` | `.env` | `PROXY_ENV_PATH` | Yes |
-| fallback JSON | `config.json` | `FALLBACK_CONFIG_PATH` | Yes |
-| model map JSON | `model-map.json` | `MODEL_MAP_PATH` | Yes |
+`aliases` 只解析到 canonical model，自身没有 route、没有 health state。
 
-`PROXY_ENV_PATH` 会覆盖 `.env` 位置。设置后，`/admin` 页面会从这个路径读取并写回 `.env`。
+`default_model` 可以是 alias，运行时会解析成 canonical model。只有配置过的模型可以被请求，未知模型名会被本地拒绝而不是转发出去。
 
-### Secret 处理
+每个渠道统一使用 `<base_url>/v1/messages` 与 `<base_url>/v1/models`，`base_url` 会去掉结尾斜杠。
 
-所有包含 `KEY`、`TOKEN`、`SECRET` 的环境变量会被视为 secret：
+Messages 处理保持原生 Anthropic 认证、SSE 事件形状、工具、thinking、模型回显与 `cache_control` 透传。本代理不涉及 OpenAI Responses 与 Codex 压缩，因此没有 compact 路由、没有 prompt cache hint 注入、没有响应缓存。
 
-- 读取：`GET /admin/config` 返回 `***`，不会返回真实值
-- 编辑：secret 字段在 UI 中显示为掩码输入框，需要显式替换
-- 保存：`PUT /admin/config` 支持 `keep`、`replace`、`clear` 三种动作；未指定时默认为 `keep`
+## Timeout 与并发控制
 
-### `.env` 写回限制
+以下默认值在 `src/anthropic-config.ts` 与仓库内示例 env 中生效：
 
-admin API 写 `.env` 时会做格式归一化：
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `PROXY_UPSTREAM_TIMEOUT_MS` | `30000` | 流式请求首次上游 fetch 超时。 |
+| `PROXY_NON_STREAM_TIMEOUT_MS` | `300000` | 非流式请求首次上游 fetch 超时。 |
+| `PROXY_FIRST_BYTE_TIMEOUT_MS` | `30000` | 等待首个响应体分片的上限。 |
+| `PROXY_FIRST_TEXT_TIMEOUT_MS` | `12000` | 提交前等待可用流式输出的上限。 |
+| `PROXY_STREAM_IDLE_TIMEOUT_MS` | `60000` | 两个上游流分片之间的最大空闲。 |
+| `PROXY_TOTAL_REQUEST_TIMEOUT_MS` | `600000` | 单个请求的总生命周期上限。 |
+| `PROXY_MAX_CONCURRENT_REQUESTS` | `128` | 活跃请求上限，超过即拒绝。 |
 
-- 注释、引号、多行值不会被保留
-- 从 `.env` 中删除某个键，不会立刻清掉进程启动时继承的 `process.env` 值
+只有在源码路径明确写明 0 会关闭该保护时才把超时设为 `0`。示例 env 保持全部超时保护开启。
 
-如果你是在清理敏感配置，建议保存后重启代理。
+## 健康、重试与额度策略
 
-### 运行时路径解析
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `PROXY_HEALTH_WINDOW_MS` | `180000` | 共享渠道健康计数的滑动窗口。 |
+| `PROXY_HEALTH_FAILURE_THRESHOLD` | `15` | 窗口内打开熔断所需的失败次数。 |
+| `PROXY_HEALTH_FAILURE_RATE_THRESHOLD` | `0.5` | 窗口内必须严格超过的失败率。 |
+| `PROXY_HEALTH_COOLDOWN_MS` | `600000` | 两个阈值同时成立后的熔断时长。 |
+| `PROXY_CHANNEL_MAX_ATTEMPTS` | `3` | 每请求每渠道的尝试上限，含首次。 |
+| `PROXY_CHANNEL_RETRY_DELAY_MS` | `500` | 同渠道两次尝试之间的等待。 |
+| `PROXY_QUOTA_COOLDOWN_MS` | `7200000` | 额度耗尽后的冷却时长。 |
 
-fallback JSON 与 model-map JSON 的 admin 路径来自当前 runtime snapshot，而不是进程启动时一次性固定。所以 reload 后，如果你修改了 `FALLBACK_CONFIG_PATH` 或 `MODEL_MAP_PATH`，后续 admin 请求会自动使用新路径。
+每次真实上游尝试在结束时计一次。渠道窗口对该渠道的普通模型路由共享，每个模型路由另有自己的窗口。必须同时满足 `失败数 >= 阈值` 与 `失败率 > 阈值` 才熔断，且成功不清空窗口。
 
-## Prompt Cache Hints
+渠道上的 `disable_cooldown` 只豁免普通自动熔断，额度与人工阻断依然生效。
 
-代理会保留客户端传入的 `prompt_cache_retention` 和 `prompt_cache_key`。如果客户端没带，也可以通过环境变量注入默认值：
+额度耗尽会立即跳过该请求的剩余尝试并停放该渠道。冷却结束时间取 `PROXY_QUOTA_COOLDOWN_MS` 与下一个北京时间 00:02（即 `min(now + quotaCooldownMs, 下一个 16:02 UTC)`）中更早者，因此每日额度刷新无需人工介入。迟到的成功不能清除额度冷却。
+
+以下旧键会被忽略并在启动时警告：`PROXY_ENDPOINT_TIMEOUT_COOLDOWN_MS`、`PROXY_ENDPOINT_INVALID_RESPONSE_COOLDOWN_MS`、`PROXY_ENDPOINT_AUTH_COOLDOWN_MS`、`PROXY_ENDPOINT_FAILURE_THRESHOLD`、`PROXY_ENDPOINT_HALF_OPEN_MAX_PROBES`、`PROXY_MAX_FALLBACK_ATTEMPTS`。管理页会把它们标为已停用，并拒绝保存仍带这些键的草稿。
+
+## Fallback 策略
+
+请求按 canonical model 的路由从最高优先级可用渠道往下走。每个渠道最多尝试 `PROXY_CHANNEL_MAX_ATTEMPTS` 次、间隔 `PROXY_CHANNEL_RETRY_DELAY_MS`，之后切换到下一个渠道。
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `PROXY_MAX_FALLBACK_TOTAL_MS` | `30000` | fallback 切换的总时间预算。 |
+| `PROXY_FALLBACK_ON_RETRYABLE_4XX` | 开启 | 允许 `408`、`409`、`423`、`425`、`429` 触发 fallback。 |
+| `PROXY_FALLBACK_ON_COMPAT_4XX` | 开启 | 允许兼容性风格的 4xx 触发 fallback。 |
+| `PROXY_FALLBACK_COMPAT_PATTERNS` | 见下 | 把 4xx 归类为兼容性失败的文本模式。 |
+| `PROXY_NO_FALLBACK_CLIENT_ERROR_PATTERNS` | 见下 | 让客户端错误留在当前渠道的文本模式。 |
+
+默认兼容性模式为 `model not found`、`unsupported model`、`未配置模型`、`does not support`、`unsupported parameter`、`store must be false`。
+
+默认客户端错误模式为 `invalid json`、`maximum context length`、`context length exceeded`、`too many input tokens`、`invalid tool schema`、`json schema is invalid`。
+
+请求已经产出有效输出后 fallback 立即停止，已输出的 SSE 也绝不重放。有效输出但缺 usage 的响应按原样返回，缺的字段在历史里保持 `NULL`。
+
+## Stream、Logging 与 Debug 控制
 
 ```env
-PROXY_PROMPT_CACHE_RETENTION=in_memory
-PROXY_PROMPT_CACHE_KEY=stable-prefix-key
-```
-
-`PROXY_PROMPT_CACHE_KEY` 只能用于稳定的 prompt 前缀 key，不要加入时间戳、UUID、request id 或其他按请求变化的熵，否则 cache hit rate 会非常差。
-
-上游 provider 是否真的支持这些 hint，仍取决于它自身实现。
-
-如果客户端会通过 Claude Code 相关网关转发到本代理，建议保持 `PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line`。这类动态 billing header 经常位于 `instructions` 的最开头，即使 `prompt_cache_key` 稳定，也可能破坏基于前缀的缓存匹配。
-
-## 调试参数（默认关闭）
-
-```env
+PROXY_STREAM_MODE=normalized
 PROXY_LOG_REQUEST_BODY=0
 PROXY_DEBUG_SSE=0
 PROXY_SSE_FAILURE_DEBUG=0
-PROXY_SSE_FAILURE_DIR=captures/proxy-11234/sse-failures
+PROXY_SSE_FAILURE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/sse-failures
 PROXY_STREAM_MISSING_USAGE_DEBUG=0
-PROXY_STREAM_MISSING_USAGE_DIR=captures/proxy-11234/stream/missing-usage
+PROXY_STREAM_MISSING_USAGE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/stream/missing-usage
 ```
 
-`PROXY_LOG_REQUEST_BODY` 会记录原始请求内容，除非你正在本地排障，否则应保持关闭。各种 debug capture 目录可能包含完整 prompt 和上游响应，默认不要开启，也绝不要提交这些输出。
+`PROXY_STREAM_MODE` 接受 `normalized` 与 `raw`，空值或不支持的值会回落到 `normalized`。
+
+客户端可用请求体的 `proxy_stream_mode` 或请求头 `x-proxy-stream-mode` 覆盖流模式。该请求体字段在转发前会被剥离。
+
+`PROXY_LOG_REQUEST_BODY=1` 会记录请求体与规范化后的预览，本地调试之外保持关闭。
+
+`PROXY_DEBUG_SSE=1` 记录解析后的 SSE 事件调试数据。
+
+SSE 失败与缺 usage 抓取可能包含 prompt、响应和上游错误，默认保持关闭，且不要提交抓取产物。
+
+## Admin 与 Runtime Reload
+
+管理路由位于 `/admin`、`/admin/config`、`/admin/stats`、`/admin/monitor`、`/admin/usage`。
+
+默认只允许本机访问，需要显式放开：
+
+```env
+PROXY_ADMIN_ALLOW_HOST=0
+```
+
+只有在受信网络控制之后才设置 `PROXY_ADMIN_ALLOW_HOST=1`。
+
+`/admin` 用五个视图编辑路由文档：渠道、模型路由、别名、环境与运行态。所有编辑先留在草稿里，只有点 `保存` 才落盘，因此切视图或拖拽路由本身不会写盘。`校验` 报告草稿的错误与警告，`重载` 丢弃草稿，`回滚` 恢复上一版文件。
+
+保存会写入 `fallback.json` 并同步重载 runtime snapshot。`POST /admin/config/reload` 用同一份文档重载，不涉及界面草稿。
+
+密钥读取时掩码，写入时必须显式替换。管理 API 写 `.env` 时不保留注释、引号与多行格式。
+
+`HOST` 或 `PORT` 变化时，reload 响应会在 `restartRequiredFields` 里列出这些名字。运行中的监听地址仍需重启进程才会变化。
+
+## Usage 与 Uptime 存储
+
+`/admin/usage` 从实例目录的 `usage.sqlite` 读取历史。每次真实上游尝试产生一行，按渠道、canonical model 与 kind 归类；SSE 中重复出现的累计 usage 只更新同一行，不新增行。
+
+Anthropic 口径把三项输入分开保存，并派生出总输入：
+
+```
+总输入 = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+```
+
+三项原始值按上游上报保存，上游未上报的项保持 `NULL` 而不是变成 `0`。`usageKnown` 与 `cacheKnown` 统计报告了完整输入与缓存数据的行数，覆盖率与求和并列可见。缓存命中率按报告了这两个字段的行做加权 `SUM(cache_read) / SUM(总输入)`。`GET /admin/usage/stats` 提供聚合结果，`GET /admin/uptime` 提供采样历史。
+
+Uptime 采样由服务端每 180 秒在 UTC 边界执行，每个模型路由保留 30 天。黄灯表示该模型窗口内只有一个阈值成立，红灯表示真实的共享、额度或人工阻断，绿灯包含无请求的路由，灰色表示该路由从未被采样。采样只读本地状态，从不请求上游。
+
+## Billing-Header 清理
+
+```env
+PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line
+```
+
+该设置处理网关塞进顶层 Anthropic `system` 文本里的 `x-anthropic-billing-header: ...`。
+
+`strip_line` 是默认值，整行删除该 billing header，保留稳定的 system prompt。
+
+`strip_cch` 保留归属行，只删掉动态的 `cch=...` 字段。
+
+只有顶层 `system` 文本会被清理，user 角色内容与其他原生 Anthropic 请求字段保持不变。

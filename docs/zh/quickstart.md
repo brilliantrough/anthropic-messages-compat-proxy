@@ -1,13 +1,16 @@
 # 快速开始
 
-这份指南帮助你从一个干净的仓库副本中快速跑起本地代理实例，并使用公开安全的示例配置文件。
-
 [English](../quickstart.md) | [中文](./quickstart.md)
+
+这份指南会从仓库跟踪的公开示例文件启动一个本地 Anthropic Messages 代理实例。
+
+客户端向本代理发送 Anthropic `POST /v1/messages` 请求。代理把 Anthropic Messages 请求转发到上游，并调用由 base URL 拼出的上游 `/v1/messages` 和 `/v1/models` 端点。
 
 ## 环境要求
 
-- 本地运行建议使用 `Node 22+` 和 `npm`
-- 如果你想先减少本地环境准备，建议直接走 `README.md` 或 `docs/operations.md` 里的 Docker 路径
+- `Node 22+`
+- `npm`
+- 一个接受 Anthropic 风格 `/v1/messages` 的上游 provider
 
 ## 1. 安装依赖
 
@@ -15,127 +18,155 @@
 npm install
 ```
 
-## 2. 创建本地运行实例目录
+## 2. 创建运行时文件
 
-从仓库中已跟踪的 example 目录复制出一个本地运行实例，并生成运行时文件：
+复制仓库中的 example 实例，再从示例文件创建本地运行时文件：
 
 ```bash
 cp -r instances/example-11234 instances/proxy-11234
 cp instances/proxy-11234/.env.example instances/proxy-11234/.env
 cp instances/proxy-11234/fallback.json.example instances/proxy-11234/fallback.json
-cp instances/proxy-11234/model-map.json.example instances/proxy-11234/model-map.json
+chmod 600 instances/proxy-11234/fallback.json
 ```
 
-`instances/proxy-11234/` 已被 `.gitignore` 忽略。真实凭据请放在这里，不要写进仓库跟踪的 example 文件里。
+真实 key 放在 `instances/proxy-11234/` 中。运行时副本会被 git 忽略，`*.example` 文件保持公开安全。
 
-仓库里的 `fallback.json.example` 默认是空的 `fallback_api_config`，这样第一次跑通时不会误打到占位 fallback 域名。
+## 3. 配置渠道与模型
 
-## 3. 填写必需的上游 provider 字段
+编辑 `instances/proxy-11234/fallback.json`，至少声明一个渠道和它服务的模型：
 
-编辑 `instances/proxy-11234/.env`，至少填写：
+```json
+{
+  "default_model": "claude-sonnet-4-5",
+  "channels": [
+    {
+      "id": "provider-a",
+      "name": "Provider A",
+      "base_url": "https://api.anthropic.com",
+      "api_key": "your_api_key_here"
+    }
+  ],
+  "models": {
+    "claude-sonnet-4-5": { "channel_ids": ["provider-a"] }
+  },
+  "aliases": {
+    "public-claude": "claude-sonnet-4-5"
+  }
+}
+```
+
+代理把 Messages 调用发送到 `<base_url>/v1/messages`，模型列表发送到 `<base_url>/v1/models`，`base_url` 会去掉结尾斜杠。
+
+客户端可以发送任意本地 `x-api-key`，该值不会转发到上游；出站上游 `x-api-key` 来自实际服务该请求的渠道。
+
+只有 `models` 里列出的 canonical model 可以被请求。`public-claude` 是 alias：转发前解析为 `claude-sonnet-4-5`，响应回显客户端请求的别名。
+
+## 4. 检查实例文件路径
+
+示例 `.env` 已经把 runtime 与 admin UI 指向复制出的文件：
 
 ```env
-PRIMARY_PROVIDER_NAME=primary-provider
-PRIMARY_PROVIDER_BASE_URL=https://provider.example
-PRIMARY_PROVIDER_API_KEY=your_api_key_here
+PROXY_ENV_PATH=./instances/proxy-11234/.env
+FALLBACK_CONFIG_PATH=./instances/proxy-11234/fallback.json
 ```
 
-通常你还会一起设置：
+`fallback.json` 就是第 3 步的路由文档。用量历史默认写在它旁边的 `usage.sqlite`，除非用 `PROXY_USAGE_DB_PATH` 覆盖。
 
-```env
-PRIMARY_PROVIDER_DEFAULT_MODEL=my-model-v2
-```
-
-示例文件已经包含：
-
-- `PROXY_ENV_PATH=./instances/proxy-11234/.env`
-- `FALLBACK_CONFIG_PATH=./instances/proxy-11234/fallback.json`
-- `MODEL_MAP_PATH=./instances/proxy-11234/model-map.json`
-
-这样 `/admin` 后台会直接读写你当前这套运行时配置文件。
-
-示例 `.env.example` 默认保留 `HOST=0.0.0.0`，这样同一套运行时文件也能直接用于 Docker。若你只是本机首次试跑且不想对局域网开放 API，可以改成 `HOST=127.0.0.1`。
-
-## 4. 构建并启动
+## 5. 构建
 
 ```bash
 npm run build
-env $(grep -v '^#' instances/proxy-11234/.env | xargs) npm run proxy:start
 ```
 
-这条命令会把实例 `.env` 中的变量加载到当前进程环境，再启动 `dist/json-proxy.js`。
+## 6. 加载实例环境并启动
 
-## 5. 检查健康状态
+```bash
+node --env-file=instances/proxy-11234/.env dist/anthropic-proxy.js
+```
+
+该命令会运行编译后的 Anthropic 代理入口。`PROXY_ENV_PATH` 告诉 runtime，admin reload 流程应读取哪个 `.env` 文件。
+
+## 7. 检查健康状态
 
 ```bash
 curl -s http://127.0.0.1:11234/healthz
 ```
 
-期望返回形状类似：
+预期字段包括 `ok`、`instanceName`、`primaryProviderName`、`upstreamMessagesUrl`、`upstreamModelsUrl`、`anthropicVersion`、`modelMappings` 和 `claudeBillingHeaderMode`。
 
-```json
-{
-  "ok": true,
-  "instanceName": "proxy-11234",
-  "port": 11234
-}
-```
-
-## 6. 发送一个非流式请求
+## 8. 发送非流式消息
 
 ```bash
-curl -s http://127.0.0.1:11234/v1/responses \
+curl -s http://127.0.0.1:11234/v1/messages \
   -H 'Content-Type: application/json' \
-  -d '{"model":"my-model-v2","input":"Reply with exactly OK.","stream":false}'
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"public-claude","max_tokens":128,"messages":[{"role":"user","content":"Reply with exactly OK."}]}'
 ```
 
-## 7. 发送一个流式请求
+请求体是 Anthropic 原生形状，使用 `model`、`max_tokens` 和 `messages`。
+
+由于 `public-claude` 是 alias，代理会向上游发送 `claude-sonnet-4-5`，并在成功 JSON 响应中回显 `public-claude`。
+
+## 9. 发送流式消息
 
 ```bash
-curl -N http://127.0.0.1:11234/v1/responses \
+curl -N http://127.0.0.1:11234/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
-  -d '{"model":"my-model-v2","input":"Count to three.","stream":true}'
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"public-claude","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"Count to three."}]}'
 ```
 
-默认 `normalized` 模式下，你应该能看到 `response.created`、`response.output_text.delta`、`response.completed` 这类 Responses 风格的 SSE 事件。
+你应该看到 Anthropic SSE 事件，例如 `message_start`、`content_block_start`、`content_block_delta`、`message_delta` 和 `message_stop`。
 
-## 8. 打开本地管理后台
+默认 `normalized` 模式下，代理会在可用输出开始后，把 `message_start` 中的模型改回客户端请求的别名。
 
-- 配置页面：`http://127.0.0.1:11234/admin`
-- provider 监控页面：`http://127.0.0.1:11234/admin/monitor`
+## 10. 打开 Admin 页面
 
-这两个页面默认都只允许 localhost 访问，远程请求会收到 `403 Forbidden`。如果你后续显式开启 `PROXY_ADMIN_ALLOW_HOST=1`，非 localhost 请求也会被接受，此时应确保端口只暴露在受信网络内。
+- Config UI: `http://127.0.0.1:11234/admin`
+- Monitor UI: `http://127.0.0.1:11234/admin/monitor`
+- Usage UI: `http://127.0.0.1:11234/admin/usage`
 
-## 推荐起步参数
+Admin 路由默认只允许 localhost。只有在可信网络控制之后，才设置 `PROXY_ADMIN_ALLOW_HOST=1`。
 
-example `.env` 里已经放入了一组偏保守、实践可用的默认值：
+## 推荐首次运行设置
+
+仓库中的示例使用这些有效默认值和起步值：
 
 ```env
-PROXY_STREAM_MODE=normalized
-PROXY_UPSTREAM_TIMEOUT_MS=50000
-PROXY_NON_STREAM_TIMEOUT_MS=240000
-PROXY_FIRST_BYTE_TIMEOUT_MS=40000
-PROXY_FIRST_TEXT_TIMEOUT_MS=120000
-PROXY_STREAM_IDLE_TIMEOUT_MS=70000
-PROXY_TOTAL_REQUEST_TIMEOUT_MS=700000
-PROXY_MAX_FALLBACK_TOTAL_MS=480000
+PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line
+PROXY_UPSTREAM_TIMEOUT_MS=30000
+PROXY_NON_STREAM_TIMEOUT_MS=300000
+PROXY_FIRST_BYTE_TIMEOUT_MS=30000
+PROXY_FIRST_TEXT_TIMEOUT_MS=12000
+PROXY_STREAM_IDLE_TIMEOUT_MS=60000
+PROXY_TOTAL_REQUEST_TIMEOUT_MS=600000
 PROXY_MAX_CONCURRENT_REQUESTS=128
-PROXY_MAX_CACHED_RESPONSES=200
+PROXY_MAX_FALLBACK_TOTAL_MS=30000
+PROXY_HEALTH_WINDOW_MS=180000
+PROXY_HEALTH_FAILURE_THRESHOLD=15
+PROXY_HEALTH_FAILURE_RATE_THRESHOLD=0.5
+PROXY_HEALTH_COOLDOWN_MS=600000
+PROXY_CHANNEL_MAX_ATTEMPTS=3
+PROXY_CHANNEL_RETRY_DELAY_MS=500
+PROXY_QUOTA_COOLDOWN_MS=7200000
 ```
 
-第一次跑通前，除非你已经非常清楚上游特性，否则建议先不要改这些值。
+策略键都可以省略：runtime 会回落到上表默认值，而不是启动失败。
 
 ## 常见错误
 
-- 忘记填写 `PRIMARY_PROVIDER_API_KEY`
-- `PRIMARY_PROVIDER_BASE_URL` 指向的地址并不提供 `/v1/responses` 和 `/v1/models`
-- 启动时没有加载实例 `.env`
-- 误改了仓库里的 `*.example` 文件，而不是本地 gitignored 的 `instances/proxy-11234/` 运行时文件
-- 误以为 `/admin` 中修改 `PORT` 或 `HOST` 后无需重启即可生效
+- `fallback.json` 里没有渠道，或在 `models` 里引用了未在 `channels` 声明的渠道 id。
+- 渠道 `base_url` 指向的 host 不提供 `/v1/messages`。
+- 启动时没有加载 `instances/proxy-11234/.env`。
+- 修改了仓库跟踪的 `*.example` 文件，而不是本地运行时文件。
+- 把 `PROXY_ENDPOINT_FAILURE_THRESHOLD` 这类已弃用键留在 `.env`：它会被忽略并警告，而且管理页拒绝保存仍带该键的草稿。
+- 以为 reload 后 `HOST` 或 `PORT` 会让已经运行的 listener 自动迁移，不需要重启。
 
 ## 下一步
 
-- 查看 [示例](./examples.md) 获取更多请求样例
-- 查看 [配置说明](./configuration.md) 了解全部配置项
-- 查看 [运维说明](./operations.md) 了解 Docker 与 systemd 部署方式
+- `docs/examples.md` 展示 `cache_control`、tools、stream mode 和 sanitized system text 的请求体。
+- `docs/configuration.md` 列出当前 runtime key 和默认值。
+- `docs/streaming-compatibility.md` 解释 Anthropic SSE 处理与 fallback 边界。

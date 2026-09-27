@@ -7,8 +7,7 @@ import {
 } from './responses-input-normalization.js';
 
 export type NormalizeAnthropicMessageRequestOptions = {
-  defaultModel: string;
-  modelMappings: Record<string, string>;
+  canonicalModel: string;
   claudeBillingHeaderMode: ClaudeBillingHeaderMode;
 };
 
@@ -45,15 +44,11 @@ export function normalizeAnthropicMessageRequest(
   options: NormalizeAnthropicMessageRequestOptions,
 ): JsonRecord {
   const { proxy_stream_mode: _proxyStreamMode, ...rest } = body;
-  const requestedModel = typeof rest.model === 'string' && rest.model.trim().length > 0
-    ? rest.model
-    : options.defaultModel;
-  const mappedModel = options.modelMappings[requestedModel] ?? requestedModel;
   const system = sanitizeSystemValue(rest.system, options.claudeBillingHeaderMode);
 
   return {
     ...rest,
-    model: mappedModel,
+    model: options.canonicalModel,
     ...(rest.system === undefined ? {} : { system }),
   };
 }

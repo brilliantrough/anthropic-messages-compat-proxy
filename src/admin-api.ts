@@ -11,6 +11,10 @@ import {
   type ConfigFileStore,
 } from './config-files.js';
 import type { RuntimeConfigStore } from './runtime-config.js';
+import type { RoutingConfig } from './routing-config.js';
+import type { HealthRegistry } from './channel-health.js';
+import { parseUsageQuery, type createUsageStore } from './usage-store.js';
+import { collectUptime, UPTIME_INTERVAL_MS, type UptimeSample } from './uptime.js';
 
 export function isLocalhost(remoteAddress: string | undefined): boolean {
   if (!remoteAddress) return false;
@@ -50,16 +54,46 @@ function getRemoteAddress(req: IncomingMessage): string | undefined {
   return req.socket.remoteAddress;
 }
 
+// Only the fields the admin surface actually reads are required, so legacy and current
+// runtime stores stay assignable without a shared concrete config type.
+export type AdminRuntimeConfig = Readonly<{
+  adminAllowHost: boolean;
+  instanceName: string;
+  routingConfigPath: string;
+  routingConfig: RoutingConfig;
+  healthWindowMs: number;
+  healthFailureThreshold: number;
+  healthFailureRateThreshold: number;
+}>;
+
+const USAGE_TOTAL_KEYS = [
+  'attempts', 'success', 'failed', 'cancelled', 'interrupted', 'pending',
+  'inputTokens', 'uncachedInputTokens', 'cacheCreationInputTokens', 'cacheReadInputTokens', 'outputTokens', 'totalTokens',
+  'cacheEligibleInput', 'cacheEligibleCached', 'durationMs',
+] as const;
+
+/** Rolls per-bucket rows up so the Usage page and the report share one definition of "total". */
+function sumUsageTotals(rows: Array<Record<string, unknown>>): Record<string, number> {
+  const totals: Record<string, number> = {};
+  for (const row of rows) {
+    for (const key of USAGE_TOTAL_KEYS) {
+      const value = row[key];
+      if (typeof value === 'number') totals[key] = (totals[key] ?? 0) + value;
+    }
+  }
+  return totals;
+}
+
 export type AdminHandlerOptions = {
   configStore: ConfigFileStore;
-  runtimeStore: RuntimeConfigStore;
+  runtimeStore: RuntimeConfigStore<AdminRuntimeConfig>;
   getAdminStats?: () => unknown;
-  clearResponseCache?: () => number;
-  responseCacheSize?: () => number;
+  healthRegistry?: HealthRegistry;
+  usageStore?: ReturnType<typeof createUsageStore>;
 };
 
 function rollbackBakFiles(store: ConfigFileStore): string[] {
-  const files = [store.envPath, store.fallbackPath, store.modelMapPath];
+  const files = [store.envPath, store.fallbackPath];
   const restored: string[] = [];
   for (const filePath of files) {
     const bakPath = filePath + '.bak';
@@ -74,8 +108,7 @@ function rollbackBakFiles(store: ConfigFileStore): string[] {
 function serveAdminStatic(res: ServerResponse, filename: string, contentType: string, subDir?: string) {
   const base = resolve(import.meta.dirname, '..', 'public', 'admin');
   const filePath = subDir ? resolve(base, subDir, filename) : resolve(base, filename);
-  const safeBase = base;
-  if (!filePath.startsWith(safeBase)) {
+  if (!filePath.startsWith(base)) {
     sendJson(res, 403, { error: { message: 'Forbidden', type: 'forbidden' } });
     return;
   }
@@ -92,18 +125,26 @@ function serveAdminStatic(res: ServerResponse, filename: string, contentType: st
   }
 }
 
-function currentConfigStore(baseStore: ConfigFileStore, runtimeStore: RuntimeConfigStore): ConfigFileStore {
+const STATIC_ASSETS: Record<string, string> = {
+  'admin.js': 'application/javascript; charset=utf-8',
+  'admin.css': 'text/css; charset=utf-8',
+  'monitor.js': 'application/javascript; charset=utf-8',
+  'monitor.css': 'text/css; charset=utf-8',
+  'usage.js': 'application/javascript; charset=utf-8',
+  'usage.css': 'text/css; charset=utf-8',
+};
+
+function currentConfigStore(baseStore: ConfigFileStore, runtimeStore: RuntimeConfigStore<AdminRuntimeConfig>): ConfigFileStore {
   const snapshot = runtimeStore.getSnapshot();
   return createConfigFileStoreFromPaths({
     envPath: baseStore.envPath,
-    fallbackPath: snapshot.config.fallbackConfigPath,
-    modelMapPath: snapshot.config.modelMappingPath,
+    fallbackPath: snapshot.config.routingConfigPath,
+    modelMapPath: baseStore.modelMapPath,
   });
 }
 
 export function createAdminHandler(options: AdminHandlerOptions) {
   const { configStore, runtimeStore } = options;
-
   return async function handleAdminRoute(
     req: IncomingMessage,
     res: ServerResponse,
@@ -120,6 +161,33 @@ export function createAdminHandler(options: AdminHandlerOptions) {
     }
 
     const store = currentConfigStore(configStore, runtimeStore);
+
+    if (method === 'POST' && url === '/admin/channels/breaker') {
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch {
+        sendJson(res, 400, { ok: false, error: { message: 'Invalid JSON body' } });
+        return true;
+      }
+      const request = body as Record<string, unknown> | null;
+      if (!request || typeof request.channelId !== 'string' || typeof request.fingerprint !== 'string' ||
+          (request.action !== 'open' && request.action !== 'close')) {
+        sendJson(res, 400, { ok: false, error: { message: 'Expected channelId, fingerprint and action (open|close)' } });
+        return true;
+      }
+      if (!options.healthRegistry) {
+        sendJson(res, 501, { ok: false, error: { message: 'Breaker control unavailable' } });
+        return true;
+      }
+      const channel = runtimeStore.getSnapshot().config.routingConfig.channelsById.get(request.channelId);
+      if (!channel || channel.fingerprint !== request.fingerprint) {
+        sendJson(res, 409, { ok: false, error: { message: 'Channel changed; refresh before controlling its breaker' } });
+        return true;
+      }
+      options.healthRegistry.control(request.channelId, request.action);
+      console.log(`admin breaker ${request.action}: ${JSON.stringify(request.channelId)}`);
+      sendJson(res, 200, { ok: true, healthSnapshot: options.healthRegistry.snapshot() });
+      return true;
+    }
 
     if (method === 'GET' && url === '/admin/config') {
       try {
@@ -205,10 +273,7 @@ export function createAdminHandler(options: AdminHandlerOptions) {
       try {
         const reloadResult = runtimeStore.reloadFromFiles();
         if (!reloadResult.ok) {
-          sendJson(res, 500, {
-            ok: false,
-            error: { message: reloadResult.error, type: 'server_error' },
-          });
+          sendJson(res, 500, { ok: false, error: { message: reloadResult.error, type: 'server_error' } });
           return true;
         }
         const snapshot = runtimeStore.getSnapshot();
@@ -258,39 +323,103 @@ export function createAdminHandler(options: AdminHandlerOptions) {
       return true;
     }
 
-    if (method === 'GET' && url === '/admin/stats') {
-      if (options.getAdminStats) {
-        sendJson(res, 200, options.getAdminStats());
-      } else {
-        sendJson(res, 200, { ok: true });
+    if (method === 'GET' && url === '/admin/uptime') {
+      if (!options.usageStore || !options.healthRegistry) {
+        sendJson(res, 501, { ok: false, error: { message: 'Uptime history unavailable' } });
+        return true;
       }
-      return true;
-    }
-
-    if (method === 'POST' && url === '/admin/cache/clear') {
-      if (options.clearResponseCache) {
-        const clearedResponses = options.clearResponseCache();
+      const routing = runtimeStore.getSnapshot().config.routingConfig;
+      const params = new URL(rawUrl, 'http://localhost').searchParams;
+      const model = params.get('model') ?? routing.defaultModel;
+      const hours = Number(params.get('hours') ?? 24);
+      const route = routing.modelRoutes.get(model);
+      if (!route || ![6, 24, 72, 168].includes(hours)) {
+        sendJson(res, 400, { ok: false, error: { message: 'Choose a configured canonical model and 6, 24, 72 or 168 hours' } });
+        return true;
+      }
+      const to = Math.floor(Date.now() / UPTIME_INTERVAL_MS) * UPTIME_INTERVAL_MS + UPTIME_INTERVAL_MS;
+      const from = to - hours * 3600000;
+      try {
+        const result = await options.usageStore.queryUptime({ from, to, model }) as { rows: UptimeSample[]; writeError: string | null };
+        const active = (row: UptimeSample) => route.channelIds.includes(row.channelId) && routing.channelsById.get(row.channelId)?.fingerprint === row.fingerprint;
         sendJson(res, 200, {
-          ok: true,
-          clearedResponses,
-          cachedResponses: options.responseCacheSize ? options.responseCacheSize() : 0,
+          ok: true, from, to, intervalMs: UPTIME_INTERVAL_MS, model, hours,
+          models: [...routing.modelRoutes.keys()],
+          channels: route.channelIds.map(id => ({ id, name: routing.channelsById.get(id)?.name ?? id })),
+          rows: result.rows.filter(active).map(({ fingerprint: _, ...row }) => row),
+          current: collectUptime(runtimeStore, options.healthRegistry).filter(row => row.model === model && active(row)).map(({ fingerprint: _, ...row }) => row),
+          writeError: result.writeError,
+          generatedAt: Date.now(),
         });
-      } else {
-        sendJson(res, 501, {
-          ok: false,
-          error: {
-            message: 'Response cache is not configured for this protocol',
-            type: 'not_implemented',
-          },
-        });
+      } catch (error) {
+        sendJson(res, 503, { ok: false, error: { message: error instanceof Error ? error.message : String(error) } });
       }
       return true;
     }
 
-    if (method === 'GET' && url === '/admin/monitor/stats') {
+    if (method === 'GET' && url === '/admin/usage/stats') {
+      const params = new URL(rawUrl, 'http://localhost').searchParams;
+      if (!params.has('from') || !params.has('to')) {
+        const hours = Number(params.get('hours') ?? 24);
+        if (![6, 24, 72, 168].includes(hours)) {
+          sendJson(res, 400, { ok: false, error: { message: 'hours must be one of 6, 24, 72 or 168 (or pass explicit from/to)' } });
+          return true;
+        }
+        const now = Date.now();
+        params.set('from', String(now - hours * 3_600_000));
+        params.set('to', String(now));
+        if (!params.has('bucket')) params.set('bucket', hours <= 48 ? 'hour' : 'day');
+      }
+      let query;
+      try { query = parseUsageQuery(params); }
+      catch (error) { sendJson(res, 400, { ok: false, error: { message: String(error instanceof Error ? error.message : error) } }); return true; }
+      try {
+        if (!options.usageStore) throw new Error('Usage storage is unavailable; restart this instance to enable it');
+        const data = await options.usageStore.query(query) as { rows?: Array<Record<string, unknown>> };
+        const config = runtimeStore.getSnapshot().config;
+        sendJson(res, 200, {
+          ...data,
+          totals: sumUsageTotals(data.rows ?? []),
+          instanceName: config.instanceName,
+          configuredChannels: Array.from(config.routingConfig.channelsById.values()).map(channel => ({ id: channel.id, name: channel.name })),
+          configuredModels: Array.from(config.routingConfig.modelRoutes.keys()),
+        });
+      } catch (error) {
+        sendJson(res, 503, { ok: false, error: { message: String(error instanceof Error ? error.message : error) } });
+      }
+      return true;
+    }
+
+    if (method === 'GET' && url === '/admin/usage') {
+      serveAdminStatic(res, 'usage.html', 'text/html; charset=utf-8');
+      return true;
+    }
+
+    if (method === 'GET' && (url === '/admin/stats' || url === '/admin/monitor/stats')) {
+      const snapshot = runtimeStore.getSnapshot();
+      const config = snapshot.config;
       sendJson(res, 200, {
         ok: true,
         ...(options.getAdminStats ? (options.getAdminStats() as Record<string, unknown>) : {}),
+        runtimeVersion: snapshot.runtimeVersion,
+        instanceName: config.instanceName,
+        routingConfigPath: config.routingConfigPath,
+        defaultModel: config.routingConfig.defaultModel,
+        channels: Array.from(config.routingConfig.channelsById.values()).map(channel => ({
+          id: channel.id,
+          name: channel.name,
+          baseUrl: channel.baseUrl,
+          fingerprint: channel.fingerprint,
+          disableCooldown: channel.disableCooldown,
+        })),
+        modelRoutes: Array.from(config.routingConfig.modelRoutes.values()).map(route => ({
+          canonicalModel: route.canonicalModel,
+          channelIds: route.channelIds,
+        })),
+        aliases: config.routingConfig.aliases,
+        healthSnapshot: options.healthRegistry?.snapshot() ?? null,
+        // The static Usage page is shared between instances, so the nav needs to know whether this one has a database.
+        usageAvailable: Boolean(options.usageStore),
       });
       return true;
     }
@@ -307,27 +436,14 @@ export function createAdminHandler(options: AdminHandlerOptions) {
 
     if (method === 'GET' && url.startsWith('/admin/assets/')) {
       const assetName = url.slice('/admin/assets/'.length);
-      if (!assetName || assetName.includes('..') || assetName.includes('/') || assetName.includes('\\')) {
+      const contentType = assetName && !assetName.includes('..') && !assetName.includes('/') && !assetName.includes('\\')
+        ? STATIC_ASSETS[assetName]
+        : undefined;
+      if (!contentType) {
         sendJson(res, 404, { error: { message: 'Not found', type: 'not_found' } });
         return true;
       }
-      if (assetName === 'admin.js') {
-        serveAdminStatic(res, 'admin.js', 'application/javascript; charset=utf-8', 'assets');
-        return true;
-      }
-      if (assetName === 'admin.css') {
-        serveAdminStatic(res, 'admin.css', 'text/css; charset=utf-8', 'assets');
-        return true;
-      }
-      if (assetName === 'monitor.js') {
-        serveAdminStatic(res, 'monitor.js', 'application/javascript; charset=utf-8', 'assets');
-        return true;
-      }
-      if (assetName === 'monitor.css') {
-        serveAdminStatic(res, 'monitor.css', 'text/css; charset=utf-8', 'assets');
-        return true;
-      }
-      sendJson(res, 404, { error: { message: 'Not found', type: 'not_found' } });
+      serveAdminStatic(res, assetName, contentType, 'assets');
       return true;
     }
 

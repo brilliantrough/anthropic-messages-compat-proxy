@@ -1,383 +1,341 @@
 # 运维说明
 
-[English](../operations.md) | [中文](./operations.md)
+Anthropic Messages 兼容代理的部署、进程管理与运维流程。
 
-本文覆盖 Responses API Compatibility Proxy 的部署、进程管理与运维操作。
-
-在把仓库推送到公开远端之前，建议先看一遍 [发布检查清单](./publishing-checklist.md)。
-
----
+发布仓库前先看 `docs/publishing-checklist.md`。
 
 ## 目录
 
 - [多实例目录结构](#多实例目录结构)
-- [不要提交真实运行实例目录](#不要提交真实运行实例目录)
+- [不要提交真实实例目录](#不要提交真实实例目录)
 - [构建与运行命令](#构建与运行命令)
-- [开发模式命令](#开发模式命令)
-- [健康检查与管理端点](#健康检查与管理端点)
-- [本地管理后台](#本地管理后台)
-- [日志与调试输出目录](#日志与调试输出目录)
+- [活跃路由](#活跃路由)
+- [本地 Admin UI](#本地-admin-ui)
+- [路由、熔断与额度](#路由熔断与额度)
+- [Usage 与 Uptime](#usage-与-uptime)
+- [日志与 Captures](#日志与-captures)
 - [Docker 部署](#docker-部署)
 - [安全重启模式](#安全重启模式)
-- [systemd 模板](#systemd-模板)
+- [Systemd 模板](#systemd-模板)
 - [从本地工作目录迁移](#从本地工作目录迁移)
-
----
 
 ## 多实例目录结构
 
-每个代理实例都通过 `instances/` 下的独立目录配置。目录名通常会包含端口，方便识别：
+每个运行实例在 `instances/` 下有自己的目录，目录名通常带端口，便于把文件、服务与健康检查对上。
 
 ```text
 instances/
   example-11234/
     .env.example
     fallback.json.example
-    model-map.json.example
-  example-11235/
-    .env.example
-    fallback.json.example
-    model-map.json.example
   proxy-11234/
     .env
     fallback.json
-    model-map.json
-  proxy-11235/
-    .env
-    fallback.json
-    model-map.json
+    usage.sqlite
 ```
 
-新增实例的基本步骤：
-
-1. 复制一个 example 目录
-2. 编辑 `instances/proxy-NEWPORT/.env`
-3. 编辑 `fallback.json` 和 `model-map.json`
-4. 使用 `npm run proxy:start`、Docker 或 systemd 启动
+从仓库内的示例目录创建新实例：
 
 ```bash
 cp -r instances/example-11234 instances/proxy-NEWPORT
+cp instances/proxy-NEWPORT/.env.example instances/proxy-NEWPORT/.env
+cp instances/proxy-NEWPORT/fallback.json.example instances/proxy-NEWPORT/fallback.json
+chmod 600 instances/proxy-NEWPORT/fallback.json
 ```
 
-## 不要提交真实运行实例目录
+编辑 `instances/proxy-NEWPORT/.env`，设置 `PORT`、`HOST`、`INSTANCE_NAME`、`PROXY_ENV_PATH`、`FALLBACK_CONFIG_PATH`。
 
-`.gitignore` 已经排除了 `instances/proxy-*/`，因为这些目录通常包含：
+然后编辑 `fallback.json`，填好 `channels`、`models`、`aliases`、`default_model`。渠道持有 base URL 与 API key，也就是过去分散在 `.env` 与 provider JSON 里的那部分。
 
-- 真实 API key
-- 本地运行路径
-- 真实 provider 配置
+每个渠道统一使用 `<base_url>/v1/messages` 与 `<base_url>/v1/models`，`base_url` 会去掉结尾斜杠。
 
-永远不要提交：
+## 不要提交真实实例目录
 
-- `instances/proxy-*`
-- 真实 `.env`
-- 带真实凭据的 `fallback.json` 或 `model-map.json`
-- `logs/`、`captures/`、`sse-failures/`
+真实实例目录已被 git 忽略，因为它们可能含密钥、本地路径、上游名称、日志、抓取产物与用量历史。
 
----
+永远不要提交 `instances/proxy-*`、真实 `.env`、线上 `fallback.json`、`usage.sqlite`、`logs/`、`captures/` 或调试产物。
+
+仓库内的 `example-*` 目录是公开安全模板，加 provider key 前先复制一份。
 
 ## 构建与运行命令
 
-| 命令 | 作用 |
+| 命令 | 用途 |
 | --- | --- |
-| `npm run build` | 编译 TypeScript 到 `dist/` |
-| `npm run proxy:start` | 运行编译后的 `dist/json-proxy.js` |
-| `npm run proxy` | 使用 `tsx` 直接运行源码 |
+| `npm run build` | 把 TypeScript 编译到 `dist/`。 |
+| `npm run proxy:start` | 运行 `node dist/anthropic-proxy.js`。 |
+| `npm run proxy` | 用 `tsx` 运行 `src/anthropic-proxy.ts`。 |
+| `npm run proxy:dev` | 与 `npm run proxy` 相同的开发入口。 |
 
-生产环境通常先执行：
+生产环境先构建，再启动编译产物：
 
 ```bash
 npm run build
-npm run proxy:start
+node --env-file=instances/proxy-11234/.env dist/anthropic-proxy.js
 ```
 
-如果你有单独的实例 `.env` 文件，也可以这样加载后再启动：
+`run.sh` 会先跑 `npm run build` 再 exec `npm run proxy:start`，它不会替你加载 `instances/<instance-name>/.env`。
+
+本仓库实际部署的服务通过下面的 systemd 模板运行编译产物。用 `npm run proxy:dev` 启动的开发实例走 `tsx` 直跑源码，因此改源码后下次启动进程即生效，不需要构建步骤。
+
+需要由进程管理器加载实例环境时使用 systemd 或 Docker。
+
+## 活跃路由
+
+### GET /healthz
+
+返回运行状态快照：实例标识、当前加载的路由配置路径、渠道与 canonical model 数量、默认模型、Anthropic header 默认值、健康窗口与尝试策略、`activeRequests`，以及用量历史是否可用。
 
 ```bash
-env $(grep -v '^#' instances/proxy-11234/.env | xargs) npm run proxy:start
+curl -s http://127.0.0.1:11234/healthz
 ```
 
-如果你使用仓库里的 `run.sh`，要注意它只会串起 `build + proxy:start`，并沿用当前 shell 环境；它不会替你加载某个实例目录下的 `.env`。
+### GET /v1/models
 
----
+通过目标模型路由中最高优先级的可用渠道代理上游模型列表。当 canonical 目标出现在上游列表中时，alias 条目也会一并暴露。
 
-## 开发模式命令
-
-| 命令 | 作用 |
-| --- | --- |
-| `npm run proxy:dev` | 用 `tsx` 运行源码，适合本地开发 |
-
----
-
-## 健康检查与管理端点
-
-### `GET /healthz`
-
-返回实例当前状态、配置摘要和 `activeRequests` 等信息。示例：
-
-```json
-{
-  "ok": true,
-  "instanceName": "proxy-11234",
-  "activeRequests": 3,
-  "maxConcurrentRequests": 128,
-  "cachedResponses": 12,
-  "port": 11234,
-  "host": "0.0.0.0"
-}
+```bash
+curl -s http://127.0.0.1:11234/v1/models \
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01'
 ```
 
-### `GET /admin/stats`
+### POST /v1/messages
 
-返回详细运行时统计信息，包括：
+接受 Anthropic Messages 的 JSON 请求与流式请求。代理在转发原生 Anthropic 报文的同时做 header 规范化、canonical model 选路、每渠道重试、有序 fallback 与流式处理。
 
-- 请求总量
-- JSON/SSE 统计
-- fallback 原因分布
-- usage 聚合
-- endpoint health
+```bash
+curl -s http://127.0.0.1:11234/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local-client-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"claude-latest","max_tokens":128,"messages":[{"role":"user","content":"Reply with exactly OK."}]}'
+```
 
-### `POST /admin/cache/clear`
+alias 会在转发前解析成 canonical model，响应回显客户端发送的模型字符串。流式客户端在请求体里设 `stream: true`，用 `curl -N` 或任意支持 SSE 的客户端。
 
-清理内存中的响应缓存，返回清掉了多少条。
+### /admin/*
 
-### `GET /v1/models`
+管理路由提供配置页、监控页、用量页、配置 API、stats API、reload 与 rollback 流程。默认只允许本机访问，除非设置了 `PROXY_ADMIN_ALLOW_HOST=1`。
 
-代理上游 `/v1/models`，并应用模型别名映射。
+不要把 `/admin/*` 直接暴露到公网。用 SSH 隧道、只监听本机的 Docker 端口映射，或带认证的本地反向代理。
 
-### `GET /v1/responses/:id`
+## 本地 Admin UI
 
-按 ID 查询缓存中的历史响应，未命中则返回 `404`。
-
-### `POST /v1/responses`
-
-主代理入口。接受 OpenAI Responses API 风格请求，并转发到上游，同时执行规范化、fallback、流式处理等逻辑。
-
-> 警告：这些 admin 端点只适合本地或受信网络环境，不应在没有认证/鉴权的情况下直接暴露到公网。
-
----
-
-## 本地管理后台
-
-访问地址：
+在代理主机上打开配置页：
 
 ```text
 http://127.0.0.1:<PORT>/admin
 ```
 
-### localhost-only 约束
+界面有五个视图——渠道、模型路由、别名、环境、运行态——以及监控页与用量页。未保存的草稿会被标记，切视图不会丢草稿，直到保存或丢弃。
 
-默认情况下，所有 `/admin` 路由只允许这些来源：
+### 校验
 
-- `127.0.0.1`
-- `::1`
-- `::ffff:127.0.0.1`
+校验通过 `POST /admin/config/validate` 检查当前草稿，报告字段错误与警告，不写文件。
 
-远程访问会得到 `403 Forbidden`。
+### 保存
 
-如果显式开启 `PROXY_ADMIN_ALLOW_HOST=1`，非 localhost 请求也会被接受。仓库自带的 Docker compose 示例就是通过这个开关，配合宿主机 `127.0.0.1` 端口绑定，让宿主机浏览器访问 `/admin` 而不把它暴露到更广的网络。若你需要更广范围访问，建议使用 SSH tunnel 或带认证的本地反代。不要直接把 `/admin` 暴露到公网。
+保存发送 `PUT /admin/config`。服务端先写 `.bak`，再写 `fallback.json`，然后从磁盘重载 runtime snapshot。
 
-### UI 页面内容
+草稿里渠道用 `apiKeyAction: "keep"`、环境项用 `secretAction: "keep"` 时密钥保持不变，只有显式替换才会改动已存密钥。
 
-管理后台包含：
+管理端写盘会重新序列化 `fallback.json` 与 `.env`：`.env` 的注释、引号与多行格式不会被保留，且带已弃用键的草稿会被拒绝保存。
 
-1. 概览：runtime version、restart-required 字段、实例信息
-2. Providers：primary provider env 字段和 fallback provider 列表
-3. Model Mappings：模型别名到目标模型的映射
-4. Runtime / Compatibility：只读运行时参数
-5. Review & Apply：Validate / Save / Reload / Rollback
+### 重载
 
-### Draft 模式
+重载调用 `POST /admin/config/reload`，从磁盘重新读取 `fallback.json` 与 `.env`，不影响浏览器草稿。
 
-前端编辑全部先停留在本地 draft 中，页面会显示 `Unsaved changes`。刷新页面会丢弃 draft，并从服务器重新加载配置。
+在 UI 之外改了实例文件后用它。
 
-### 工作流
+### 回滚
 
-#### Validate
+回滚调用 `POST /admin/config/rollback`，恢复 `.env` 与 `fallback.json` 的最近 `.bak`，然后重载 runtime config。
 
-调用 `POST /admin/config/validate`，只校验 draft，不改文件。
+没有 `.bak` 时回滚返回成功，恢复列表为空。
 
-#### Save
+### 需要重启的字段
 
-1. 前端把 draft 发送到 `PUT /admin/config`
-2. 服务端先写 `.bak` 备份，再写入配置，再触发 runtime reload
-3. 成功后前端重新读取配置
-4. 如果修改涉及 `PORT` 或 `HOST`，会显示“需要重启”提示
+运行态重载可以即时应用渠道、canonical model、alias、超时、日志与策略改动。
 
-#### Reload
+`HOST` 或 `PORT` 的变化会在 `restartRequiredFields` 里列出，只有进程重启后才生效。
 
-调用 `POST /admin/config/reload`，适合手工改过文件后重新加载。
+### 监控
 
-#### Rollback
-
-调用 `POST /admin/config/rollback`，恢复最近一次保存前的 `.bak` 文件并 reload。
-
-### Provider Monitor
-
-监控页面：
+在代理主机上打开监控页：
 
 ```text
 http://127.0.0.1:<PORT>/admin/monitor
 ```
 
-它会展示：
+监控页在可见时每秒读取一次 `GET /admin/monitor/stats`，轮询保持安静，不会每次刷新都写一行日志。
 
-- 全局请求统计
-- provider 熔断状态
-- 冷却剩余时间
-- 最近失败原因
-- 活跃请求趋势
+页面展示全局计数、每个模型路由及其渠道优先级的概览、每渠道与每模型的健康窗口、额度冷却、人工熔断状态，以及只存在浏览器内存里的活跃请求趋势。
 
-监控页面通过 `GET /admin/monitor/stats` 每秒轮询一次。默认 admin 策略下，这个 stats 路由也只允许 localhost 访问；如果开启了 `PROXY_ADMIN_ALLOW_HOST=1`，同样需要遵守受信网络边界。这个 stats 路由本身不会每秒写一条日志。
+每个渠道行带即时熔断控制：`立即熔断` 用默认时长打开人工阻断，`立即恢复` 清除该渠道的全部阻断与失败窗口。恢复时迟到的在途结果会被丢弃，不会覆盖新状态。
 
-### Restart Required 提示
+`GET /admin/stats` 以 JSON 返回同样的运维数据，供排查与脚本使用。
 
-如果 reload 检测到 `PORT` 或 `HOST` 变化，后台会显示显眼的 restart-required 提示。这种改动必须重启进程后才真正生效。
+### 用量
 
-### 常见错误场景
+在代理主机上打开用量页：
 
-- Save 成功写盘，但 reload 失败
-- Rollback 时没有 `.bak` 文件
-- Draft 校验失败
-- 网络或服务端错误
+```text
+http://127.0.0.1:<PORT>/admin/usage
+```
 
-这些情况都会在 UI 中显示明确错误提示。
+它按所选时间范围读取 `GET /admin/usage/stats`，并从 `GET /admin/uptime` 取可用性灯带。每次真实上游尝试算一行，包含 fallback 失败；管理调用、健康检查、本地拒绝的请求与响应缓存读取都不计数。
 
----
+## 路由、熔断与额度
 
-## 日志与调试输出目录
+健康状态按渠道记录普通 Messages 路由的共享窗口，另外按渠道+模型记录每个模型窗口。每次真实上游尝试在结束时计一次，记录开始时间与渠道，并关联 canonical model；成功不清空窗口。
 
-`.gitignore` 默认排除了这些目录：
+只有当滚动窗口内两个条件同时成立时渠道才打开自动熔断：失败数达到 `PROXY_HEALTH_FAILURE_THRESHOLD`，且失败率严格高于 `PROXY_HEALTH_FAILURE_RATE_THRESHOLD`。熔断保持 `PROXY_HEALTH_COOLDOWN_MS`。这里没有半开探测预算：冷却结束后重新开始统计新窗口，只有恢复后收集到的统计才决定下一次阻断。
 
-| 目录 | 内容 | 风险 |
-| --- | --- | --- |
-| `logs/` | 请求日志 | 可能包含 prompt 片段 |
-| `captures/` | SSE failure / missing usage 调试输出 | 可能包含完整 prompt 与上游响应 |
-| `sse-failures/` | 原始 SSE 失败文本 | 可能包含完整 prompt 与上游响应 |
-| `dist/` | 编译产物 | 可重新构建 |
+`disable_cooldown` 只豁免自动熔断，额度与人工阻断对这类渠道依然生效。
 
-相关调试环境变量：
+额度耗尽与请求隔离：该请求的剩余尝试立即跳过，渠道被停放到 `min(now + PROXY_QUOTA_COOLDOWN_MS, 下一个北京时间 00:02)`，迟到的成功不能清除它。
+
+当所有候选路由都已被阻断且尚未开始任何上游请求时，代理返回 `503 model_channels_unavailable` 并带 `Retry-After`。如果至少开始过一次尝试且所有可用路由都失败，则保留 `fallback_exhausted` 语义。
+
+reload 会先完整校验新文档，再同步替换 runtime snapshot、health 设置与 topology；fingerprint 仍然匹配的状态会保留，旧 topology 下签发的 lease 会被忽略。
+
+要有意让某个渠道下线，请用监控页的人工熔断，而不是改它的 API key 或把它从路由里删掉。人工阻断能跨 reload 保留，会出现在可用性历史里，并且一键即可解除。
+
+## Usage 与 Uptime
+
+实例目录下的 `usage.sqlite` 保存尝试历史与可用性采样。服务端每 180 秒在 UTC 边界采样一次，保留 30 天，并且只读本地状态——采样过程从不请求上游。
+
+Anthropic 口径把三项输入分开保存，总输入按 `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` 派生。上游未上报的分量保持 `NULL` 而不是 `0`，覆盖率计数会显示有多少行报告了完整数据。
+
+备份实例时连带 `.env`、`fallback.json` 与 `usage.sqlite` 一起复制运行目录，备份放在 git 之外并按密钥同等保护。
+
+```bash
+mkdir -p backups
+tar -czf backups/proxy-11234-config.tgz instances/proxy-11234
+```
+
+只有在进程停止时才能删除或移动 `usage.sqlite`。未完成的记录会在下次启动时变成 `interrupted`，因此非正常退出不会凭空产生一条成功记录。
+
+## 日志与 Captures
+
+运行日志默认写到 stdout 与 stderr，除非进程管理器重定向。systemd 用 `journalctl`，Docker 用 `docker compose logs`。
+
+抓取调试默认关闭，只在事故处理期间打开，事后关闭并删掉抓取文件。
 
 ```env
+PROXY_LOG_REQUEST_BODY=0
 PROXY_DEBUG_SSE=0
 PROXY_SSE_FAILURE_DEBUG=0
-PROXY_SSE_FAILURE_DIR=captures/proxy-11234/sse-failures
+PROXY_SSE_FAILURE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/sse-failures
 PROXY_STREAM_MISSING_USAGE_DEBUG=0
-PROXY_STREAM_MISSING_USAGE_DIR=captures/proxy-11234/stream/missing-usage
+PROXY_STREAM_MISSING_USAGE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/stream/missing-usage
 PROXY_STREAM_MODE=normalized
 ```
 
-默认不要开启这些调试输出。排障结束后也要尽快删除已经生成的 captures。
-
----
+抓取文件可能包含 prompt、工具入参、上游错误与上游响应，按敏感运维数据处理。日志记录渠道 id、canonical model、尝试结果与 fallback 原因，从不打印 API key。
 
 ## Docker 部署
 
-这是目前最简单的公开部署路径。Docker 容器中不需要 systemd，因为容器只运行前台单进程代理。
+Docker 以前台单进程方式运行 `node dist/anthropic-proxy.js`。
 
-### 准备运行实例目录
+先准备本地运行实例：
 
 ```bash
 cp -r instances/example-11234 instances/proxy-11234
 cp instances/proxy-11234/.env.example instances/proxy-11234/.env
 cp instances/proxy-11234/fallback.json.example instances/proxy-11234/fallback.json
-cp instances/proxy-11234/model-map.json.example instances/proxy-11234/model-map.json
+chmod 600 instances/proxy-11234/fallback.json
 ```
 
-编辑 `.env`：
+在 `instances/proxy-11234/.env` 填监听值与本地文件路径：
 
 ```env
-PRIMARY_PROVIDER_NAME=primary-provider
-PRIMARY_PROVIDER_BASE_URL=https://provider.example
-PRIMARY_PROVIDER_API_KEY=your_api_key_here
+ANTHROPIC_VERSION=2023-06-01
 PROXY_ENV_PATH=./instances/proxy-11234/.env
 FALLBACK_CONFIG_PATH=./instances/proxy-11234/fallback.json
-MODEL_MAP_PATH=./instances/proxy-11234/model-map.json
 ```
 
-仓库里的 `fallback.json.example` 默认是空的，只有在你真的需要多上游 failover 时再补 fallback provider 即可。
+渠道 base URL 与 API key 属于 `fallback.json`，不放进 `.env`。
 
-### 启动 compose
+启动 compose：
 
 ```bash
 docker compose up --build
 ```
 
-仓库里的 `docker-compose.yaml` 会：
+compose 会加载 `./instances/proxy-11234/.env`，把 `./instances/proxy-11234` 挂到 `/app/instances/proxy-11234`，绑定 `127.0.0.1:11234:11234`，并设置 `PROXY_ADMIN_ALLOW_HOST=1`。
 
-- 使用本地 `Dockerfile` 构建镜像
-- 从 `./instances/proxy-11234/.env` 加载环境变量
-- 将 `./instances/proxy-11234` 挂载到容器中的 `/app/instances/proxy-11234`
-- 发布 `127.0.0.1:11234:11234`
-- 设置 `PROXY_ADMIN_ALLOW_HOST=1`，允许宿主机浏览器访问 `/admin`
+只绑本机让 `/admin/*` 在主机可用而不会对外发布。若改动绑定地址，需要补更强的保护。
 
-如果宿主机 `11234` 已被占用，可以手动修改 compose 文件里 `ports:` 的宿主机侧映射。
+启动后的主机地址：
 
-### 宿主机访问地址
+```text
+http://127.0.0.1:11234/v1/messages
+http://127.0.0.1:11234/v1/models
+http://127.0.0.1:11234/admin
+http://127.0.0.1:11234/admin/monitor
+http://127.0.0.1:11234/admin/usage
+```
 
-- API：`http://127.0.0.1:11234/v1/responses`
-- Config UI：`http://127.0.0.1:11234/admin`
-- Provider Monitor：`http://127.0.0.1:11234/admin/monitor`
-
-### 日志与生命周期
+日志与停止用 Docker 生命周期命令：
 
 ```bash
 docker compose logs -f
 docker compose down
 ```
 
-### 编辑挂载配置
-
-admin UI 对 `.env`、`fallback.json`、`model-map.json` 的修改会直接落到宿主机挂载目录中。
-
-### admin 访问安全
-
-`PROXY_ADMIN_ALLOW_HOST=1` 只适合 Docker 场景下通过宿主机访问 `/admin`。它应该始终是显式 opt-in。
-
-当前 compose 文件绑定到 `127.0.0.1`，因此 `/admin` 只会暴露给宿主机本地。如果你改成 `0.0.0.0` 或发布到更广的网络范围，也会把 admin 一起暴露出去，此时应额外加保护。
-
----
+实例目录以读写方式挂载，因此管理页的写入会落到主机，用量历史同样落在该目录。
 
 ## 安全重启模式
 
-如果你使用 systemd 部署，并且想等所有进行中的请求结束后再重启，可以使用 `wait-proxy-idle.sh`：
+重启用户级 systemd 实例前先用 `wait-proxy-idle.sh`，它轮询 `/healthz` 直到 `activeRequests` 为 0，或服务已经停止。
 
 ```bash
-./wait-proxy-idle.sh proxy-NEWPORT NEWPORT
-systemctl --user restart responses-proxy@proxy-NEWPORT
+./wait-proxy-idle.sh proxy-11234 11234
+systemctl --user restart anthropic-messages-proxy@proxy-11234.service
 ```
 
-它会轮询 `/healthz`，直到 `activeRequests === 0` 为止。
+脚本默认用 `anthropic-messages-proxy@<instance-name>` 作为 `WAIT_PROXY_IDLE_SERVICE`，并尽量从实例名后缀推导端口。
 
-支持的环境变量覆盖：
+可用覆盖项：
 
-| 变量 | 默认值 | 作用 |
+| 变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `WAIT_PROXY_IDLE_PORT` | 从实例名后缀提取 | 覆盖 health check 端口 |
-| `WAIT_PROXY_IDLE_INTERVAL` | `0.5` | 轮询间隔（秒） |
-| `WAIT_PROXY_IDLE_SERVICE` | `responses-proxy@<INSTANCE_NAME>` | systemd 服务名 |
-| `WAIT_PROXY_IDLE_STATUS_URL` | `http://127.0.0.1:<PORT>/healthz` | 健康检查 URL |
+| `WAIT_PROXY_IDLE_PORT` | 从实例名推导，否则 `11236` | 覆盖健康检查端口。 |
+| `WAIT_PROXY_IDLE_INTERVAL` | `0.5` | 轮询间隔秒数。 |
+| `WAIT_PROXY_IDLE_SERVICE` | `anthropic-messages-proxy@<instance-name>` | 覆盖 systemd unit。 |
+| `WAIT_PROXY_IDLE_STATUS_URL` | `http://127.0.0.1:<PORT>/healthz` | 覆盖健康检查 URL。 |
 
----
+一行重启：
 
-## systemd 模板
+```bash
+./wait-proxy-idle.sh proxy-11234 11234 && systemctl --user restart anthropic-messages-proxy@proxy-11234.service
+```
 
-仓库提供了模板：
+系统级服务用同样的等待命令并配上对应的 `WAIT_PROXY_IDLE_SERVICE`，然后 `sudo systemctl restart`。
 
-`deploy/systemd/responses-proxy@.service.example`
+## Systemd 模板
 
-内容大致如下：
+仓库内模板是 `deploy/systemd/anthropic-messages-proxy@.service.example`。
+
+它使用的部署路径是：
+
+```text
+/opt/anthropic-messages-compat-proxy
+```
+
+模板内容：
 
 ```ini
 [Unit]
-Description=Responses API Compatibility Proxy (%i)
+Description=Anthropic Messages Compatibility Proxy (%i)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/responses-api-compat-proxy
-EnvironmentFile=/opt/responses-api-compat-proxy/instances/%i/.env
+WorkingDirectory=/opt/anthropic-messages-compat-proxy
+EnvironmentFile=/opt/anthropic-messages-compat-proxy/instances/%i/.env
 ExecStart=/usr/bin/env npm run proxy:start
 Restart=on-failure
 RestartSec=5
@@ -387,101 +345,71 @@ TimeoutStopSec=120
 WantedBy=default.target
 ```
 
-### 安装方式
-
-用户级服务：
+安装用户级服务：
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp deploy/systemd/responses-proxy@.service.example ~/.config/systemd/user/responses-proxy@.service
-```
-
-系统级服务：
-
-```bash
-sudo cp deploy/systemd/responses-proxy@.service.example /etc/systemd/system/responses-proxy@.service
-```
-
-启用：
-
-```bash
+cp deploy/systemd/anthropic-messages-proxy@.service.example ~/.config/systemd/user/anthropic-messages-proxy@.service
 systemctl --user daemon-reload
-systemctl --user enable --now responses-proxy@proxy-NEWPORT
+systemctl --user enable --now anthropic-messages-proxy@proxy-11234.service
 ```
 
-或：
+安装系统级服务：
 
 ```bash
+sudo cp deploy/systemd/anthropic-messages-proxy@.service.example /etc/systemd/system/anthropic-messages-proxy@.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now responses-proxy@proxy-NEWPORT
+sudo systemctl enable --now anthropic-messages-proxy@proxy-11234.service
 ```
 
-需要按你的部署环境调整：
+系统级服务按主机策略把 `WantedBy=default.target` 改成 `multi-user.target`。
 
-- `WorkingDirectory`
-- `EnvironmentFile`
-- `WantedBy`
-- 实例命名方式
+`%i` 就是实例目录名。`anthropic-messages-proxy@proxy-11234.service` 加载 `/opt/anthropic-messages-compat-proxy/instances/proxy-11234/.env`。
 
-不要把你本地私有的 host、绝对路径、systemd unit 名回写到仓库里。
+systemd 靠 `EnvironmentFile` 加载实例环境，直接调用 `run.sh` 时不会加载。
 
-### `%i` 的含义
+本地 unit 改动、主机名、私有路径与服务名不要进 git。
 
-systemd 服务名中的 `%i` 会被实例目录名替换。例如：
-
-- `responses-proxy@proxy-11234`
-
-会读取：
-
-- `instances/proxy-11234/.env`
-
-### `TimeoutStopSec`
-
-默认的 `TimeoutStopSec=120` 给正在运行的流式请求预留了最多两分钟结束时间。如果你的 `PROXY_TOTAL_REQUEST_TIMEOUT_MS` 更大，可能需要同步调大 `TimeoutStopSec`。
-
----
+`TimeoutStopSec=120` 给在途流两分钟收尾时间。让它与 `PROXY_TOTAL_REQUEST_TIMEOUT_MS` 对齐，避免 systemd 过早杀进程。
 
 ## 从本地工作目录迁移
 
-如果你之前一直在个人工作目录中直接运行代理，后续准备迁移到正式部署路径：
-
-1. 在目标目录重新安装依赖并构建
+在目标部署路径构建：
 
 ```bash
-cd /opt/responses-api-compat-proxy
-npm install --omit=dev
+cd /opt/anthropic-messages-compat-proxy
+npm ci
 npm run build
+npm prune --omit=dev
 ```
 
-2. 复制运行实例配置
+把实例文件复制到目标路径：
 
 ```bash
-mkdir -p instances/proxy-NEWPORT
-cp /path/to/old/instances/proxy-NEWPORT/.env instances/proxy-NEWPORT/.env
-cp /path/to/old/instances/proxy-NEWPORT/fallback.json instances/proxy-NEWPORT/fallback.json
-cp /path/to/old/instances/proxy-NEWPORT/model-map.json instances/proxy-NEWPORT/model-map.json
+mkdir -p instances/proxy-11234
+cp /path/to/old/instances/proxy-11234/.env instances/proxy-11234/.env
+cp /path/to/old/instances/proxy-11234/fallback.json instances/proxy-11234/fallback.json
+chmod 600 instances/proxy-11234/fallback.json
 ```
 
-3. 更新 `.env` 里的路径
+更新复制过来的 `.env` 路径：
 
 ```env
-PROXY_ENV_PATH=./instances/proxy-NEWPORT/.env
-FALLBACK_CONFIG_PATH=./instances/proxy-NEWPORT/fallback.json
-MODEL_MAP_PATH=./instances/proxy-NEWPORT/model-map.json
-PROXY_SSE_FAILURE_DIR=captures/proxy-NEWPORT/sse-failures
-PROXY_STREAM_MISSING_USAGE_DIR=captures/proxy-NEWPORT/stream/missing-usage
+PROXY_ENV_PATH=./instances/proxy-11234/.env
+FALLBACK_CONFIG_PATH=./instances/proxy-11234/fallback.json
+PROXY_SSE_FAILURE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/sse-failures
+PROXY_STREAM_MISSING_USAGE_DIR=./instances/proxy-11234/captures/anthropic-proxy-11234/stream/missing-usage
 ```
 
-4. 按前面的 systemd 模板安装并启动
+用 systemd 模板安装并启动 `anthropic-messages-proxy@proxy-11234.service`。
 
-5. 验证服务是否健康
+验证迁移后的实例：
 
 ```bash
-curl -s http://127.0.0.1:NEWPORT/healthz
-curl -s http://127.0.0.1:NEWPORT/admin/stats
-curl -s http://127.0.0.1:NEWPORT/admin/monitor/stats
+curl -s http://127.0.0.1:11234/healthz
+curl -s http://127.0.0.1:11234/v1/models
+curl -s http://127.0.0.1:11234/admin/stats
+curl -s http://127.0.0.1:11234/admin/monitor/stats
 ```
 
-6. 确认没问题后，停掉旧进程
-
-7. 清理旧工作目录中的真实实例配置、日志和 captures，避免遗留敏感信息
+新实例健康后停掉旧进程，并清理上一个工作目录里的真实实例目录、`.env`、日志与抓取产物。
