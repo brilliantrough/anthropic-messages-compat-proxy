@@ -13,6 +13,8 @@ export const DEFAULT_ADMIN_ENV: Record<string, string> = {
   ...routingPolicyDefaults,
   ANTHROPIC_VERSION: '2023-06-01',
   PROXY_CLAUDE_BILLING_HEADER_MODE: 'strip_line',
+  PROXY_CACHE_CONTROL_MODE: 'off',
+  PROXY_CACHE_CONTROL_TTL: '5m',
   PROXY_STREAM_MODE: 'normalized',
   PROXY_UPSTREAM_TIMEOUT_MS: '30000',
   PROXY_NON_STREAM_TIMEOUT_MS: '300000',
@@ -364,6 +366,18 @@ function validateEnvDraft(value: unknown, errors: string[]): void {
     }
     if (e.key === 'PROXY_STREAM_MODE' && e.value !== undefined && !['normalized', 'raw'].includes(String(e.value).trim().toLowerCase())) {
       errors.push(`draft.env[${i}].value must be 'normalized' or 'raw' for PROXY_STREAM_MODE`);
+    }
+    if (
+      e.key === 'PROXY_CACHE_CONTROL_MODE' && e.value !== undefined &&
+      !['off', 'standardize'].includes(String(e.value).trim().toLowerCase().replace(/-/g, '_'))
+    ) {
+      errors.push(`draft.env[${i}].value must be 'off' or 'standardize' for PROXY_CACHE_CONTROL_MODE`);
+    }
+    if (
+      e.key === 'PROXY_CACHE_CONTROL_TTL' && e.value !== undefined &&
+      !['5m', '1h'].includes(String(e.value).trim().toLowerCase())
+    ) {
+      errors.push(`draft.env[${i}].value must be '5m' or '1h' for PROXY_CACHE_CONTROL_TTL`);
     }
     if (
       typeof e.key === 'string' && NUMERIC_ENV_KEYS.includes(e.key) && e.value !== undefined &&

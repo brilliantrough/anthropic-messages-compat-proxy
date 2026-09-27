@@ -3,6 +3,7 @@ import { dirname, join, resolve } from 'node:path';
 import { parse as dotenvParse } from 'dotenv';
 import type { ClaudeBillingHeaderMode } from './responses-input-normalization.js';
 import { isEnabled } from './proxy-config.js';
+import type { CacheControlMode } from './anthropic-input-normalization.js';
 import { loadRoutingConfig, type RoutingConfig } from './routing-config.js';
 import { LEGACY_ROUTING_ENV_KEYS, readRoutingPolicyConfig, routingPolicyDefaults } from './routing-policy.js';
 
@@ -18,6 +19,8 @@ export type AnthropicRuntimeConfig = {
   anthropicVersion: string;
   anthropicBeta: string | undefined;
   claudeBillingHeaderMode: ClaudeBillingHeaderMode;
+  cacheControlMode: CacheControlMode;
+  cacheControlTtl: string;
   healthWindowMs: number;
   healthFailureThreshold: number;
   healthFailureRateThreshold: number;
@@ -60,6 +63,34 @@ function parseEnvList(value: string | undefined, defaults: string[]): string[] {
     .split(/[,\n]/)
     .map(item => item.trim())
     .filter(item => item.length > 0);
+}
+
+export function parseCacheControlMode(value: string | undefined): CacheControlMode {
+  if (value === undefined || value.trim() === '') {
+    return 'off';
+  }
+  const normalized = value.trim().toLowerCase().replace(/-/g, '_');
+  if (normalized === 'off' || normalized === 'standardize') {
+    return normalized;
+  }
+  console.warn(
+    `Ignoring unsupported PROXY_CACHE_CONTROL_MODE value ${JSON.stringify(value)}; expected "off" or "standardize"`,
+  );
+  return 'off';
+}
+
+export function parseCacheControlTtl(value: string | undefined): string {
+  if (value === undefined || value.trim() === '') {
+    return '5m';
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === '5m' || normalized === '1h') {
+    return normalized;
+  }
+  console.warn(
+    `Ignoring unsupported PROXY_CACHE_CONTROL_TTL value ${JSON.stringify(value)}; expected "5m" or "1h"`,
+  );
+  return '5m';
 }
 
 function parseClaudeBillingHeaderMode(value: string | undefined): ClaudeBillingHeaderMode {
@@ -142,6 +173,8 @@ export function createAnthropicRuntimeConfig(envPath: string): AnthropicRuntimeC
     anthropicVersion: env.ANTHROPIC_VERSION ?? '2023-06-01',
     anthropicBeta: env.ANTHROPIC_BETA?.trim() || undefined,
     claudeBillingHeaderMode: parseClaudeBillingHeaderMode(env.PROXY_CLAUDE_BILLING_HEADER_MODE),
+    cacheControlMode: parseCacheControlMode(env.PROXY_CACHE_CONTROL_MODE),
+    cacheControlTtl: parseCacheControlTtl(env.PROXY_CACHE_CONTROL_TTL),
     ...policy,
     maxFallbackTotalMs,
     upstreamTimeoutMs: Number(env.PROXY_UPSTREAM_TIMEOUT_MS ?? 30000),

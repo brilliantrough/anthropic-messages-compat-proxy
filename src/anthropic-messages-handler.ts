@@ -181,6 +181,8 @@ export type AnthropicMessagesHandlerOptions = {
   anthropicBeta: string | undefined;
   defaultModel: string;
   claudeBillingHeaderMode: ClaudeBillingHeaderMode;
+  cacheControlMode: import('./anthropic-input-normalization.js').CacheControlMode;
+  cacheControlTtl: string;
   maxFallbackTotalMs: number;
   upstreamTimeoutMs: number;
   nonStreamingRequestTimeoutMs: number;
@@ -723,6 +725,8 @@ export async function handleMessagesRequest(
   const upstreamBody = normalizeAnthropicMessageRequest(requestBody, {
     canonicalModel: route.canonicalModel,
     claudeBillingHeaderMode: options.claudeBillingHeaderMode,
+    cacheControlMode: options.cacheControlMode,
+    cacheControlTtl: options.cacheControlTtl,
   });
   logRequestBodiesPreview(options.requestId, requestBody, upstreamBody, {
     enabled: options.logRequestBodies,
@@ -864,6 +868,8 @@ export async function handleMessagesRequest(
         connectMs: connectTimeoutMs,
         firstByteMs: options.firstByteTimeoutMs,
         claudeBillingHeaderMode: options.claudeBillingHeaderMode,
+        cacheControlMode: options.cacheControlMode,
+        cacheControlTtl: options.cacheControlTtl,
       });
 
       upstreamAttemptController = createLinkedAbortController(parentController.controller.signal);

@@ -163,6 +163,22 @@ PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line
 
 `strip_line` is the default and removes the whole billing header line. If you need to keep the attribution text, use `strip_cch` to remove only the dynamic `cch=...` field. User messages are left untouched.
 
+## Prompt Cache Control
+
+By default the proxy passes every client-placed `cache_control` through untouched.
+
+`standardize` mode rewrites the caching strategy instead: it strips every `cache_control` the client placed anywhere in the request, then marks the last content block of the last message with a single `"type": "ephemeral"` breakpoint and the configured TTL. For incrementally growing conversations this caches the whole prefix each turn and the next turn reads it back as a cache hit.
+
+```env
+PROXY_CACHE_CONTROL_MODE=off
+PROXY_CACHE_CONTROL_TTL=5m
+```
+
+- `PROXY_CACHE_CONTROL_MODE` - `off` (default, pass through) or `standardize` (strip all, single breakpoint on the last message's last content block)
+- `PROXY_CACHE_CONTROL_TTL` - breakpoint TTL, `5m` (default) or `1h`; `1h` writes cost 2x input tokens, `5m` writes cost 1.25x
+
+Note `standardize` also replaces breakpoints clients such as Claude Code place on `system` and `tools`; the effect is visible in `/admin/usage` via `cache_creation_input_tokens` / `cache_read_input_tokens`.
+
 ## Checks
 
 ```bash
@@ -182,6 +198,8 @@ npm run build
 - `PROXY_MAX_FALLBACK_TOTAL_MS` - total wall-clock fallback budget per request, default `30000`
 - `PROXY_CHANNEL_MAX_ATTEMPTS` - attempts per request per channel including the first, default `3`
 - `PROXY_CHANNEL_RETRY_DELAY_MS` - delay between two attempts on the same channel, default `500`
+- `PROXY_CACHE_CONTROL_MODE` - cache_control rewrite policy, `off` (default, pass through) or `standardize` (strip all client markers, single ephemeral breakpoint on the last message's last content block)
+- `PROXY_CACHE_CONTROL_TTL` - breakpoint TTL for `standardize` mode, `5m` (default) or `1h`
 - `PROXY_HEALTH_WINDOW_MS` - rolling window for the shared channel counters, default `180000`
 - `PROXY_HEALTH_FAILURE_THRESHOLD` - failures in the window needed to open the breaker, default `15`
 - `PROXY_HEALTH_FAILURE_RATE_THRESHOLD` - failure rate that must be strictly exceeded, default `0.5`

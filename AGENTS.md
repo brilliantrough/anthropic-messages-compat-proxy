@@ -28,7 +28,7 @@ OpenAI Responses, Codex compaction, prompt-cache hint injection, and response ca
 
 Never forward a client supplied `x-api-key` upstream. The outbound upstream `x-api-key` must come from the channel that serves the request.
 
-Prompt caching stays native to Anthropic Messages. Preserve `cache_control` where the client places it. Do not add synthetic cache keys, retention hints, random IDs, timestamps, or request IDs to prompt content.
+Prompt caching stays native by default: with `PROXY_CACHE_CONTROL_MODE=off` the proxy preserves `cache_control` exactly where the client places it. The opt-in `standardize` mode strips every client `cache_control` and marks the last content block of the last message with a single ephemeral breakpoint (`PROXY_CACHE_CONTROL_TTL`, `5m` or `1h`, default `5m`). In both modes, never add synthetic cache keys, retention hints, random IDs, timestamps, or request IDs to prompt content.
 
 Gateway billing attribution can appear in top-level `system` text. Keep that prefix stable by sanitizing top-level `system` according to `PROXY_CLAUDE_BILLING_HEADER_MODE`.
 

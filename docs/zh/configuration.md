@@ -200,3 +200,16 @@ PROXY_CLAUDE_BILLING_HEADER_MODE=strip_line
 `strip_cch` 保留归属行，只删掉动态的 `cch=...` 字段。
 
 只有顶层 `system` 文本会被清理，user 角色内容与其他原生 Anthropic 请求字段保持不变。
+
+## Prompt 缓存改写
+
+```env
+PROXY_CACHE_CONTROL_MODE=off
+PROXY_CACHE_CONTROL_TTL=5m
+```
+
+`off` 是默认值：客户端放在任何位置的 `cache_control` 原样透传，与 Anthropic 原生 prompt caching 行为一致。
+
+`standardize` 会改写缓存策略：先删掉请求里所有客户端 `cache_control`（包括 `system` 和 `tools` 上的），再在最后一条消息的最后一个 content 块上放唯一的 `{"type":"ephemeral","ttl":...}` 断点。逐轮增长的会话每轮写入全量前缀缓存，下一轮整段命中读回。
+
+`PROXY_CACHE_CONTROL_TTL` 可选 `5m`（默认，写入 1.25x）或 `1h`（写入 2x，但能跨过更长的闲置间隔）。效果可在 `/admin/usage` 通过分立的 `cache_creation_input_tokens` / `cache_read_input_tokens` 列观测。

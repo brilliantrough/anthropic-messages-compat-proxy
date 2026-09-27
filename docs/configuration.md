@@ -198,3 +198,16 @@ This setting handles gateway-added `x-anthropic-billing-header: ...` text that a
 `strip_cch` keeps the attribution line but removes the dynamic `cch=...` field.
 
 Only top-level `system` text is sanitized. User-role content and other native Anthropic request fields are preserved.
+
+## Prompt Cache Control Rewriting
+
+```env
+PROXY_CACHE_CONTROL_MODE=off
+PROXY_CACHE_CONTROL_TTL=5m
+```
+
+`off` is the default: every client-placed `cache_control` passes through untouched, matching Anthropic-native prompt caching.
+
+`standardize` rewrites the strategy: all client `cache_control` markers anywhere in the request (including `system` and `tools`) are stripped, then the last content block of the last message gets a single `{"type":"ephemeral","ttl":...}` breakpoint. Growing conversations then write the full prefix as a cache entry each turn and read it back on the next turn.
+
+`PROXY_CACHE_CONTROL_TTL` picks `5m` (default, 1.25x write) or `1h` (2x write, survives longer idle gaps). The effect is observable in `/admin/usage` through the separate `cache_creation_input_tokens` / `cache_read_input_tokens` columns.

@@ -81,6 +81,7 @@
   var RUNTIME_KEYS = [
     'PORT', 'HOST', 'INSTANCE_NAME', 'ANTHROPIC_VERSION', 'ANTHROPIC_BETA',
     'PROXY_STREAM_MODE', 'PROXY_CLAUDE_BILLING_HEADER_MODE',
+    'PROXY_CACHE_CONTROL_MODE', 'PROXY_CACHE_CONTROL_TTL',
     'PROXY_UPSTREAM_TIMEOUT_MS', 'PROXY_NON_STREAM_TIMEOUT_MS', 'PROXY_FIRST_BYTE_TIMEOUT_MS',
     'PROXY_FIRST_TEXT_TIMEOUT_MS', 'PROXY_STREAM_IDLE_TIMEOUT_MS', 'PROXY_TOTAL_REQUEST_TIMEOUT_MS',
     'PROXY_MAX_CONCURRENT_REQUESTS', 'PROXY_MAX_FALLBACK_TOTAL_MS',
@@ -221,13 +222,33 @@
           }
           checkDirty();
         });
-      } else if (envEntry.key === 'PROXY_CLAUDE_BILLING_HEADER_MODE') {
+      } else if (envEntry.key === 'PROXY_CACHE_CONTROL_MODE') {
         control = document.createElement('select');
-        ['strip_line', 'strip_cch'].forEach(function(mode) {
+        ['off', 'standardize'].forEach(function(mode) {
           var option = document.createElement('option');
           option.value = mode;
           option.textContent = mode;
-          if ((draftEntry.value || 'strip_line') === mode) option.selected = true;
+          if ((draftEntry.value || 'off') === mode) option.selected = true;
+          control.appendChild(option);
+        });
+        control.dataset.key = envEntry.key;
+        control.addEventListener('change', function() {
+          var key = this.dataset.key;
+          for (var j = 0; j < draftEnv.length; j += 1) {
+            if (draftEnv[j].key === key) {
+              draftEnv[j].value = this.value;
+              break;
+            }
+          }
+          checkDirty();
+        });
+      } else if (envEntry.key === 'PROXY_CACHE_CONTROL_TTL') {
+        control = document.createElement('select');
+        ['5m', '1h'].forEach(function(ttl) {
+          var option = document.createElement('option');
+          option.value = ttl;
+          option.textContent = ttl;
+          if ((draftEntry.value || '5m') === ttl) option.selected = true;
           control.appendChild(option);
         });
         control.dataset.key = envEntry.key;

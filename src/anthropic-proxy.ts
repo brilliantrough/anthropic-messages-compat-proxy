@@ -70,6 +70,8 @@ export type AnthropicProxyConfig = {
   anthropicVersion?: string;
   anthropicBeta?: string;
   claudeBillingHeaderMode?: ClaudeBillingHeaderMode;
+  cacheControlMode?: import('./anthropic-input-normalization.js').CacheControlMode;
+  cacheControlTtl?: string;
   healthWindowMs?: number;
   healthFailureThreshold?: number;
   healthFailureRateThreshold?: number;
@@ -131,6 +133,8 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
       anthropicVersion: config.anthropicVersion ?? '2023-06-01',
       anthropicBeta: config.anthropicBeta,
       claudeBillingHeaderMode: config.claudeBillingHeaderMode ?? 'strip_line',
+      cacheControlMode: config.cacheControlMode ?? 'off',
+      cacheControlTtl: config.cacheControlTtl ?? '5m',
       healthWindowMs: config.healthWindowMs ?? 180000,
       healthFailureThreshold: config.healthFailureThreshold ?? 15,
       healthFailureRateThreshold: config.healthFailureRateThreshold ?? 0.5,
@@ -179,6 +183,8 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
       anthropicBeta: c.anthropicBeta,
       defaultModel: c.routingConfig.defaultModel,
       claudeBillingHeaderMode: c.claudeBillingHeaderMode,
+      cacheControlMode: c.cacheControlMode,
+      cacheControlTtl: c.cacheControlTtl,
       maxFallbackTotalMs: c.maxFallbackTotalMs,
       upstreamTimeoutMs: c.upstreamTimeoutMs,
       nonStreamingRequestTimeoutMs: c.nonStreamingRequestTimeoutMs,
@@ -257,6 +263,8 @@ export function createAnthropicProxyServer(config: AnthropicProxyConfig) {
             anthropicVersion: c.anthropicVersion,
             anthropicBeta: c.anthropicBeta ?? null,
             claudeBillingHeaderMode: c.claudeBillingHeaderMode,
+            cacheControlMode: c.cacheControlMode,
+            cacheControlTtl: c.cacheControlTtl,
             healthWindowMs: c.healthWindowMs,
             healthFailureThreshold: c.healthFailureThreshold,
             healthFailureRateThreshold: c.healthFailureRateThreshold,
@@ -356,6 +364,8 @@ export function buildAdminStats(
     anthropicVersion: config.anthropicVersion,
     anthropicBeta: config.anthropicBeta ?? null,
     claudeBillingHeaderMode: config.claudeBillingHeaderMode,
+    cacheControlMode: config.cacheControlMode,
+    cacheControlTtl: config.cacheControlTtl,
     channels: Array.from(config.routingConfig.channelsById.values()).map(channel => ({
       id: channel.id,
       name: channel.name,
@@ -444,6 +454,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     anthropicVersion: s.anthropicVersion,
     anthropicBeta: s.anthropicBeta,
     claudeBillingHeaderMode: s.claudeBillingHeaderMode,
+    cacheControlMode: s.cacheControlMode,
+    cacheControlTtl: s.cacheControlTtl,
     healthWindowMs: s.healthWindowMs,
     healthFailureThreshold: s.healthFailureThreshold,
     healthFailureRateThreshold: s.healthFailureRateThreshold,
@@ -491,6 +503,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.log(`Total request lifetime timeout: ${s.totalRequestTimeoutMs}ms, fallback total budget: ${s.maxFallbackTotalMs}ms`);
     console.log(`Default stream mode: ${s.defaultStreamMode}`);
     console.log(`Claude billing header mode: ${s.claudeBillingHeaderMode}`);
+    console.log(`Cache control mode: ${s.cacheControlMode} (ttl=${s.cacheControlTtl})`);
     console.log(`Request body logging: ${s.logRequestBodies ? 'enabled' : 'disabled'}`);
     console.log(`SSE debug logging: ${s.debugSse ? 'enabled' : 'disabled'}`);
     console.log(`Retryable 4xx fallback: ${s.fallbackOnRetryable4xx ? 'enabled' : 'disabled'}`);
